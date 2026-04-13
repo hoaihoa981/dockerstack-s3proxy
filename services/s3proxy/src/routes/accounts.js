@@ -6,6 +6,11 @@
 import { db, getAccountById, getAllAccounts, upsertAccount } from '../db.js'
 import { rtdbBatchPatch } from '../firebase.js'
 import { reloadAccountsFromRTDB, reloadAccountsFromSQLite } from '../accountPool.js'
+import {
+  buildRtdbAccountPath,
+  suggestAccountId,
+  validateAccountIdForRealtime,
+} from '../accountId.js'
 
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key)
@@ -107,6 +112,7 @@ function getImportEntries(payload) {
 
 function toRtdbAccountDocument(account) {
   return {
+    accountId: account.account_id,
     accessKeyId: account.access_key_id,
     secretAccessKey: account.secret_key,
     endpoint: account.endpoint,
@@ -166,6 +172,7 @@ function normalizeAccountEntries(payload) {
     }
 
     const accountId = normalizeString(entry.accountId ?? entry.account_id ?? fallbackId)
+    const accountIdValidation = validateAccountIdForRealtime(accountId)
     const accessKeyId = normalizeString(entry.accessKeyId ?? entry.access_key_id)
     const secretKey = normalizeString(entry.secretAccessKey ?? entry.secret_key)
     const endpoint = normalizeString(entry.endpoint)
@@ -174,7 +181,14 @@ function normalizeAccountEntries(payload) {
     const addressingStyle = normalizeAddressingStyle(entry.addressingStyle ?? entry.addressing_style)
     const payloadSigningMode = normalizePayloadSigningMode(entry.payloadSigningMode ?? entry.payload_signing_mode)
 
-    if (!accountId) errors.push(`${sourceLabel}.accountId is required`)
+    if (!accountIdValidation.valid) {
+      const suggestion = suggestAccountId(accountId)
+      let message = `${sourceLabel}.accountId ${accountIdValidation.reason}`
+      if (suggestion && suggestion !== accountIdValidation.accountId) {
+        message += ` (suggested: ${suggestion})`
+      }
+      errors.push(message)
+    }
     if (!accessKeyId) errors.push(`${sourceLabel}.accessKeyId is required`)
     if (!secretKey) errors.push(`${sourceLabel}.secretAccessKey is required`)
     if (!endpoint) errors.push(`${sourceLabel}.endpoint is required`)
@@ -183,11 +197,12 @@ function normalizeAccountEntries(payload) {
     if (!addressingStyle) errors.push(`${sourceLabel}.addressingStyle must be one of: path, virtual`)
     if (!payloadSigningMode) errors.push(`${sourceLabel}.payloadSigningMode must be one of: unsigned, signed`)
 
-    if (accountId) {
-      if (seenIds.has(accountId)) {
+    if (accountIdValidation.valid) {
+      const normalizedId = accountIdValidation.accountId
+      if (seenIds.has(normalizedId)) {
         errors.push(`${sourceLabel}.accountId duplicates another imported account`)
       }
-      seenIds.add(accountId)
+      seenIds.add(normalizedId)
     }
 
     if (endpoint) {
@@ -210,9 +225,9 @@ function normalizeAccountEntries(payload) {
       continue
     }
 
-    const previous = getAccountById(accountId)
+    const previous = getAccountById(accountIdValidation.accountId)
     const row = {
-      account_id: accountId,
+      account_id: accountIdValidation.accountId,
       access_key_id: accessKeyId,
       secret_key: secretKey,
       endpoint,
@@ -252,7 +267,7 @@ async function importAccountsHandler(request, reply) {
   applyAccountRows(rows)
   reloadAccountsFromSQLite()
 
-  const updates = Object.fromEntries(rows.map((row) => [`/accounts/${row.account_id}`, toRtdbAccountDocument(row)]))
+  const updates = Object.fromEntries(rows.map((row) => [buildRtdbAccountPath(row.account_id), toRtdbAccountDocument(row)]))
   let rtdbSynced = true
   let warning = ''
 

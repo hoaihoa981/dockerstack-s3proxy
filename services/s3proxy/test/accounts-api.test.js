@@ -231,6 +231,7 @@ async function testSingleAccountImport(fastify) {
     assert(body.accounts[0].addressingStyle === 'virtual', `single import addressingStyle=${body.accounts[0].addressingStyle}`)
     assert(body.accounts[0].payloadSigningMode === 'signed', `single import payloadSigningMode=${body.accounts[0].payloadSigningMode}`)
     assert(!('secretAccessKey' in body.accounts[0]), 'single import response leaked secretAccessKey')
+    assert(fakeRtdb.state.accounts.acc01?.accountId === 'acc01', 'single import missing accountId in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.addressingStyle === 'virtual', 'single import missing addressingStyle in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.payloadSigningMode === 'signed', 'single import missing payloadSigningMode in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.bucket === 'bucket-01', 'single import missing in fake RTDB')
@@ -370,6 +371,66 @@ async function testInvalidImportValidation(fastify) {
   }
 }
 
+async function testRealtimeSafeAccountIdValidation(fastify) {
+  try {
+    const before = getAllAccounts().length
+
+    const singleRes = await fastify.inject({
+      method: 'POST',
+      url: '/admin/accounts',
+      headers: {
+        'x-api-key': 'test',
+        'content-type': 'application/json',
+      },
+      payload: {
+        accountId: 'supabaseS3-o861.cloudflare',
+        accessKeyId: 'key-dot',
+        secretAccessKey: 'secret-dot',
+        endpoint: 'https://dot.supabase.co/storage/v1/s3',
+        region: 'ap-southeast-1',
+        bucket: 'dot-bucket',
+      },
+    })
+
+    const mapRes = await fastify.inject({
+      method: 'POST',
+      url: '/admin/accounts/import',
+      headers: {
+        'x-api-key': 'test',
+        'content-type': 'application/json',
+      },
+      payload: {
+        accounts: {
+          'map.with.dot': {
+            accessKeyId: 'key-map-dot',
+            secretAccessKey: 'secret-map-dot',
+            endpoint: 'https://map-dot.supabase.co/storage/v1/s3',
+            region: 'ap-southeast-1',
+            bucket: 'map-dot-bucket',
+          },
+        },
+      },
+    })
+
+    const singleBody = singleRes.json()
+    const mapBody = mapRes.json()
+    const after = getAllAccounts().length
+
+    assert(singleRes.statusCode === 400, `single dot-id status=${singleRes.statusCode}`)
+    assert(mapRes.statusCode === 400, `map dot-id status=${mapRes.statusCode}`)
+    assert(singleBody.errors.some((value) => value.includes('account.accountId')), 'single dot-id missing accountId error')
+    assert(singleBody.errors.some((value) => value.includes('suggested: supabaseS3-o861-cloudflare')), 'single dot-id missing suggested normalized id')
+    assert(mapBody.errors.some((value) => value.includes('accounts.map.with.dot.accountId')), 'map dot-id missing accountId error')
+    assert(mapBody.errors.some((value) => value.includes('suggested: map-with-dot')), 'map dot-id missing suggested normalized id')
+    assert(after === before, `dot-id validation changed local account count before=${before} after=${after}`)
+    assert(!fakeRtdb.state.accounts['supabaseS3-o861.cloudflare'], 'dot-id unexpectedly written to fake RTDB')
+    assert(!fakeRtdb.state.accounts['map.with.dot'], 'map dot-id unexpectedly written to fake RTDB')
+    ok('accountId duoc validate theo chuan realtime va chan ky tu khong hop le')
+  } catch (err) {
+    fail('accountId realtime-safe validation', err)
+  }
+}
+
 async function main() {
   console.log('─'.repeat(60))
   console.log('T7 - Accounts API Tests')
@@ -382,6 +443,7 @@ async function main() {
     await testBulkImportFromMapAndExportShape(fastify)
     await testListAccounts(fastify)
     await testInvalidImportValidation(fastify)
+    await testRealtimeSafeAccountIdValidation(fastify)
   } finally {
     await fastify.close().catch(() => {})
     await fakeRtdb.close().catch(() => {})

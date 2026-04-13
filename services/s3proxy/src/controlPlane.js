@@ -8,6 +8,7 @@ import { rtdbSet, rtdbPatch } from './firebase.js'
 import { buildRtdbRouteDocument } from './metadata.js'
 import { metrics, refreshMetadataMetrics } from './routes/metrics.js'
 import config from './config.js'
+import { buildRtdbAccountPath } from './accountId.js'
 
 export async function syncRouteToRtdb(route) {
   await rtdbSet(`/routes/${route.encoded_key}`, buildRtdbRouteDocument(route))
@@ -16,7 +17,10 @@ export async function syncRouteToRtdb(route) {
 
 export async function syncAccountUsageToRtdb(account) {
   if (!account?.account_id) return
-  await rtdbPatch(`/accounts/${account.account_id}`, { usedBytes: account.used_bytes ?? 0 })
+  await rtdbPatch(buildRtdbAccountPath(account.account_id), {
+    accountId: account.account_id,
+    usedBytes: account.used_bytes ?? 0,
+  })
 }
 
 export async function syncAccountsUsageBatch(accounts = [], log = console) {

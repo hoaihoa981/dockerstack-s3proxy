@@ -12,6 +12,10 @@ import {
 import { rtdbGet, rtdbPatch } from './firebase.js'
 import { metrics } from './routes/metrics.js'
 import config from './config.js'
+import {
+  buildRtdbAccountPath,
+  resolveAccountIdFromRtdbEntry,
+} from './accountId.js'
 
 export class StorageFullError extends Error {
   constructor(message = 'All storage accounts are at capacity') {
@@ -101,7 +105,10 @@ export async function patchAccountUsageToRtdb(accountId) {
   const account = accountMap.get(accountId)
   if (!account) return
 
-  await rtdbPatch(`/accounts/${accountId}`, { usedBytes: account.used_bytes })
+  await rtdbPatch(buildRtdbAccountPath(accountId), {
+    accountId,
+    usedBytes: account.used_bytes,
+  })
 }
 
 export async function reloadAccountsFromRTDB() {
@@ -110,7 +117,9 @@ export async function reloadAccountsFromRTDB() {
     const ids = []
 
     if (rtdbAccounts && typeof rtdbAccounts === 'object') {
-      for (const [accountId, data] of Object.entries(rtdbAccounts)) {
+      for (const [accountKey, data] of Object.entries(rtdbAccounts)) {
+        const accountId = resolveAccountIdFromRtdbEntry(accountKey, data?.accountId ?? data?.account_id)
+        if (!accountId) continue
         ids.push(accountId)
         upsertAccount({
           account_id: accountId,
