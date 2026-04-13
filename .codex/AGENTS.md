@@ -15,7 +15,7 @@ Use conversational summary content (not commit-style), aligned with what Codex s
 Required structure in `.opushforce.message`:
 
 1. Opening line confirming rule-following, for example:
-   `Đã làm đúng theo rule trong AGENTS.md: mình đã cập nhật .opushforce.message trước khi trả lời.`
+   `feat:<tóm tắt nội dung>` and/or `fix:<tóm tắt nội dung>`
 2. Section: `Input của user`
 3. Section: `Nguyên nhân gốc`
 4. Section: `Cách đã chỉnh để khắc phục`
