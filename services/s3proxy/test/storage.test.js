@@ -107,6 +107,36 @@ async function testSelectAccount() {
   }
 }
 
+async function testSelectAccountByPublicBucket() {
+  try {
+    upsertAccount({
+      account_id: 'acc-public',
+      access_key_id: 'kp',
+      secret_key: 'sp',
+      endpoint: 'https://public.supabase.co/storage/v1/s3',
+      region: 'auto',
+      bucket: 'public-bucket',
+      public_bucket: 1,
+      quota_bytes: 5 * GB,
+      used_bytes: 10 * MB,
+      active: 1,
+      added_at: Date.now(),
+    })
+    reloadAccountsFromSQLite()
+
+    const privateSelected = selectAccountForUpload(1 * MB)
+    const publicSelected = selectAccountForUpload(1 * MB, { publicBucket: true })
+
+    if (privateSelected.account_id === 'acc1' && publicSelected.account_id === 'acc-public') {
+      ok('selectAccountForUpload tach rieng private/public backend dung theo publicBucket')
+    } else {
+      fail('selectAccountForUpload public/private separation', new Error(`private=${privateSelected.account_id} public=${publicSelected.account_id}`))
+    }
+  } catch (err) {
+    fail('selectAccountForUpload public/private separation', err)
+  }
+}
+
 async function testCommitUploadMetadata() {
   try {
     const committed = commitUploadedObjectMetadata({
@@ -373,6 +403,7 @@ async function main() {
 
   await testUpsertAndOrder()
   await testSelectAccount()
+  await testSelectAccountByPublicBucket()
   await testCommitUploadMetadata()
   await testUpsertRouteAutoCreatesBucket()
   await testEnsureBucketsFromActiveRoutesRepairsMissingBuckets()

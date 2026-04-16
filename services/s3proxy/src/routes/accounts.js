@@ -146,6 +146,7 @@ function toRtdbAccountDocument(account) {
       accessTokenExp: account.supabase_access_token_exp ?? null,
       accessTokenExperimental: account.supabase_access_token_exp ?? null,
     },
+    publicBucket: account.public_bucket === 1,
     quotaBytes: account.quota_bytes,
     usedBytes: account.used_bytes,
     active: account.active === 1,
@@ -166,6 +167,7 @@ function toPublicAccount(account, action = null) {
     supabaseAccessTokenExp: account.supabase_access_token_exp ?? null,
     supabaseAccessTokenExperimental: account.supabase_access_token_exp ?? null,
     hasSupabaseAccessToken: Boolean(account.supabase_access_token),
+    publicBucket: account.public_bucket === 1 || account.public_bucket === true,
     quotaBytes: account.quota_bytes,
     usedBytes: account.used_bytes,
     active: account.active === 1 || account.active === true,
@@ -286,6 +288,7 @@ function normalizeAccountEntries(payload) {
     const quotaBytes = normalizePositiveInteger(entry.quotaBytes ?? entry.quota_bytes, 5_368_709_120, 'quotaBytes', errors, sourceLabel)
     const usedBytes = normalizeNonNegativeInteger(entry.usedBytes ?? entry.used_bytes, 0, 'usedBytes', errors, sourceLabel)
     const addedAt = normalizeNonNegativeInteger(entry.addedAt ?? entry.added_at, Date.now(), 'addedAt', errors, sourceLabel)
+    const publicBucket = normalizeBoolean(entry.publicBucket ?? entry.public_bucket, false) ? 1 : 0
     const active = normalizeBoolean(entry.active, true) ? 1 : 0
 
     if (errors.length > errorCountBefore) {
@@ -305,6 +308,7 @@ function normalizeAccountEntries(payload) {
       email_owner: emailOwner,
       supabase_access_token: supabaseAccessToken,
       supabase_access_token_exp: supabaseAccessTokenExp,
+      public_bucket: publicBucket,
       quota_bytes: quotaBytes,
       used_bytes: usedBytes,
       active,

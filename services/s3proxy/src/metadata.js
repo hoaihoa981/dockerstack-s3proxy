@@ -5,12 +5,14 @@
 
 import {
   ROUTE_RECONCILE_STATUS,
+  ROUTE_SCOPE,
   ROUTE_STATE,
   ROUTE_SYNC_STATE,
 } from './db.js'
 
 export const LIST_TOKEN_VERSION = 1
 export const ORPHAN_BUCKET = '__orphan__'
+export const PUBLIC_PROXY_BUCKET = 'public-bucket-proxy'
 
 export function encodeKey(bucket, objectKey) {
   return Buffer.from(`${bucket}/${objectKey}`).toString('base64url')
@@ -69,6 +71,8 @@ export function toRouteCacheValue(route) {
     state: route.state,
     deletedAt: route.deleted_at ?? null,
     metadataVersion: route.metadata_version ?? 1,
+    routeScope: route.route_scope ?? ROUTE_SCOPE.MAIN,
+    publicUrl: route.public_url ?? null,
     syncState: route.sync_state ?? ROUTE_SYNC_STATE.SYNCED,
     reconcileStatus: route.reconcile_status ?? ROUTE_RECONCILE_STATUS.HEALTHY,
   }
@@ -94,6 +98,8 @@ export function buildRtdbRouteDocument(route) {
     updatedAt: route.updated_at ?? Date.now(),
     deletedAt: route.deleted_at ?? null,
     metadataVersion: route.metadata_version ?? 1,
+    routeScope: route.route_scope ?? ROUTE_SCOPE.MAIN,
+    publicUrl: route.public_url ?? null,
     state: route.state ?? ROUTE_STATE.ACTIVE,
     syncState: route.sync_state ?? ROUTE_SYNC_STATE.SYNCED,
     reconcileStatus: route.reconcile_status ?? ROUTE_RECONCILE_STATUS.HEALTHY,
@@ -119,6 +125,8 @@ export function routeFromRtdb(encodedKey, doc = {}) {
     updated_at: doc.updatedAt ?? doc.uploadedAt ?? Date.now(),
     deleted_at: doc.deletedAt ?? null,
     metadata_version: doc.metadataVersion ?? 1,
+    route_scope: doc.routeScope ?? ROUTE_SCOPE.MAIN,
+    public_url: doc.publicUrl ?? null,
     state: doc.state ?? ROUTE_STATE.ACTIVE,
     sync_state: doc.syncState ?? ROUTE_SYNC_STATE.SYNCED,
     reconcile_status: doc.reconcileStatus ?? ROUTE_RECONCILE_STATUS.HEALTHY,
@@ -146,6 +154,8 @@ export function buildOpaqueOrphanRoute(accountId, backendKey, inventory = {}, no
     updated_at: now,
     deleted_at: null,
     metadata_version: inventory.metadataVersion ?? 1,
+    route_scope: ROUTE_SCOPE.MAIN,
+    public_url: null,
     state: ROUTE_STATE.ORPHANED,
     sync_state: ROUTE_SYNC_STATE.PENDING_SYNC,
     reconcile_status: ROUTE_RECONCILE_STATUS.NEEDS_REVIEW,

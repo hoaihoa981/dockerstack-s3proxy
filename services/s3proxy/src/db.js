@@ -28,6 +28,11 @@ export const ROUTE_SYNC_STATE = Object.freeze({
   PENDING_SYNC: 'PENDING_SYNC',
 })
 
+export const ROUTE_SCOPE = Object.freeze({
+  MAIN: 'main',
+  PUBLIC: 'public',
+})
+
 export const ROUTE_RECONCILE_STATUS = Object.freeze({
   HEALTHY: 'HEALTHY',
   WRONG_ACCOUNT: 'WRONG_ACCOUNT',
@@ -88,6 +93,7 @@ db.exec(`
     email_owner    TEXT    NOT NULL DEFAULT '',
     supabase_access_token TEXT NOT NULL DEFAULT '',
     supabase_access_token_exp TEXT,
+    public_bucket  INTEGER NOT NULL DEFAULT 0,
     quota_bytes    INTEGER NOT NULL DEFAULT 5368709120,
     used_bytes     INTEGER NOT NULL DEFAULT 0,
     active         INTEGER NOT NULL DEFAULT 1,
@@ -108,6 +114,8 @@ db.exec(`
     updated_at            INTEGER NOT NULL DEFAULT 0,
     deleted_at            INTEGER,
     metadata_version      INTEGER NOT NULL DEFAULT 1,
+    route_scope           TEXT    NOT NULL DEFAULT 'main',
+    public_url            TEXT,
     state                 TEXT    NOT NULL DEFAULT 'ACTIVE',
     sync_state            TEXT    NOT NULL DEFAULT 'SYNCED',
     reconcile_status      TEXT    NOT NULL DEFAULT 'HEALTHY',
@@ -155,6 +163,8 @@ ensureColumn('routes', 'content_type', 'content_type TEXT')
 ensureColumn('routes', 'updated_at', 'updated_at INTEGER NOT NULL DEFAULT 0')
 ensureColumn('routes', 'deleted_at', 'deleted_at INTEGER')
 ensureColumn('routes', 'metadata_version', 'metadata_version INTEGER NOT NULL DEFAULT 1')
+ensureColumn('routes', 'route_scope', "route_scope TEXT NOT NULL DEFAULT 'main'")
+ensureColumn('routes', 'public_url', 'public_url TEXT')
 ensureColumn('routes', 'state', "state TEXT NOT NULL DEFAULT 'ACTIVE'")
 ensureColumn('routes', 'sync_state', "sync_state TEXT NOT NULL DEFAULT 'SYNCED'")
 ensureColumn('routes', 'reconcile_status', "reconcile_status TEXT NOT NULL DEFAULT 'HEALTHY'")
@@ -167,6 +177,7 @@ ensureColumn('accounts', 'payload_signing_mode', "payload_signing_mode TEXT NOT 
 ensureColumn('accounts', 'email_owner', "email_owner TEXT NOT NULL DEFAULT ''")
 ensureColumn('accounts', 'supabase_access_token', "supabase_access_token TEXT NOT NULL DEFAULT ''")
 ensureColumn('accounts', 'supabase_access_token_exp', 'supabase_access_token_exp TEXT')
+ensureColumn('accounts', 'public_bucket', 'public_bucket INTEGER NOT NULL DEFAULT 0')
 ensureColumn('buckets', 'updated_at', 'updated_at INTEGER NOT NULL DEFAULT 0')
 ensureColumn('buckets', 'deleted_at', 'deleted_at INTEGER')
 ensureColumn('buckets', 'versioning_status', "versioning_status TEXT NOT NULL DEFAULT ''")
@@ -189,6 +200,10 @@ db.exec(`
   WHERE metadata_version IS NULL OR metadata_version = 0;
 
   UPDATE routes
+  SET route_scope = 'main'
+  WHERE COALESCE(route_scope, '') = '';
+
+  UPDATE routes
   SET state = 'ACTIVE'
   WHERE COALESCE(state, '') = '';
 
@@ -204,9 +219,14 @@ db.exec(`
   SET backend_key = object_key
   WHERE COALESCE(backend_key, '') = '';
 
+  UPDATE accounts
+  SET public_bucket = COALESCE(public_bucket, 0)
+  WHERE public_bucket IS NULL;
+
   INSERT OR IGNORE INTO buckets (bucket, created_at, updated_at, deleted_at, versioning_status)
   SELECT bucket, MIN(uploaded_at), MAX(updated_at), NULL, ''
   FROM routes
+  WHERE route_scope = 'main'
   GROUP BY bucket;
 
   UPDATE buckets
@@ -216,10 +236,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_routes_account ON routes(account_id);
   CREATE INDEX IF NOT EXISTS idx_routes_account_backend ON routes(account_id, backend_key);
   CREATE INDEX IF NOT EXISTS idx_routes_bucket_object ON routes(bucket, object_key, state, deleted_at);
+  CREATE INDEX IF NOT EXISTS idx_routes_scope_bucket_object ON routes(route_scope, bucket, object_key, state, deleted_at);
   CREATE INDEX IF NOT EXISTS idx_routes_uploaded ON routes(uploaded_at);
   CREATE INDEX IF NOT EXISTS idx_routes_sync_state ON routes(sync_state, updated_at);
   CREATE INDEX IF NOT EXISTS idx_routes_state ON routes(state, account_id);
+  CREATE INDEX IF NOT EXISTS idx_routes_scope_state ON routes(route_scope, state, updated_at);
   CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(active, used_bytes);
+  CREATE INDEX IF NOT EXISTS idx_accounts_public_active ON accounts(public_bucket, active, used_bytes);
   CREATE INDEX IF NOT EXISTS idx_buckets_deleted ON buckets(deleted_at, bucket);
   CREATE INDEX IF NOT EXISTS idx_cron_jobs_enabled ON cron_jobs(enabled, updated_at);
 `)
@@ -265,6 +288,8 @@ function normalizeRouteForWrite(route, existing) {
     updated_at: updatedAt,
     deleted_at: toNullableTimestamp(route.deleted_at ?? existing?.deleted_at ?? null),
     metadata_version: Number(route.metadata_version ?? existing?.metadata_version ?? 1) || 1,
+    route_scope: route.route_scope ?? existing?.route_scope ?? ROUTE_SCOPE.MAIN,
+    public_url: route.public_url ?? existing?.public_url ?? null,
     state: route.state ?? existing?.state ?? ROUTE_STATE.ACTIVE,
     sync_state: route.sync_state ?? existing?.sync_state ?? ROUTE_SYNC_STATE.SYNCED,
     reconcile_status: route.reconcile_status ?? existing?.reconcile_status ?? ROUTE_RECONCILE_STATUS.HEALTHY,
@@ -284,6 +309,11 @@ const stmts = {
       deleted_at = excluded.deleted_at,
       versioning_status = excluded.versioning_status
   `),
+  getAllBuckets: db.prepare(`
+    SELECT *
+    FROM buckets
+    ORDER BY bucket ASC
+  `),
   getBucket: db.prepare(`
     SELECT *
     FROM buckets
@@ -299,10 +329,10 @@ const stmts = {
   upsertAccount: db.prepare(`
     INSERT OR REPLACE INTO accounts
       (account_id, access_key_id, secret_key, endpoint, region, bucket, addressing_style, payload_signing_mode,
-       email_owner, supabase_access_token, supabase_access_token_exp, quota_bytes, used_bytes, active, added_at)
+       email_owner, supabase_access_token, supabase_access_token_exp, public_bucket, quota_bytes, used_bytes, active, added_at)
     VALUES
       (@account_id, @access_key_id, @secret_key, @endpoint, @region, @bucket, @addressing_style, @payload_signing_mode,
-       @email_owner, @supabase_access_token, @supabase_access_token_exp, @quota_bytes, @used_bytes, @active, @added_at)
+       @email_owner, @supabase_access_token, @supabase_access_token_exp, @public_bucket, @quota_bytes, @used_bytes, @active, @added_at)
   `),
   getAllAccounts: db.prepare(`SELECT * FROM accounts ORDER BY used_bytes ASC, account_id ASC`),
   getAllActiveAccounts: db.prepare(`SELECT * FROM accounts WHERE active = 1 ORDER BY used_bytes ASC, account_id ASC`),
@@ -342,14 +372,14 @@ const stmts = {
     INSERT INTO routes (
       encoded_key, account_id, bucket, object_key, backend_key,
       size_bytes, etag, last_modified, content_type,
-      uploaded_at, updated_at, deleted_at, metadata_version,
+      uploaded_at, updated_at, deleted_at, metadata_version, route_scope, public_url,
       state, sync_state, reconcile_status,
       backend_last_seen_at, backend_missing_since, last_reconciled_at,
       instance_id
     ) VALUES (
       @encoded_key, @account_id, @bucket, @object_key, @backend_key,
       @size_bytes, @etag, @last_modified, @content_type,
-      @uploaded_at, @updated_at, @deleted_at, @metadata_version,
+      @uploaded_at, @updated_at, @deleted_at, @metadata_version, @route_scope, @public_url,
       @state, @sync_state, @reconcile_status,
       @backend_last_seen_at, @backend_missing_since, @last_reconciled_at,
       @instance_id
@@ -367,6 +397,8 @@ const stmts = {
       updated_at = excluded.updated_at,
       deleted_at = excluded.deleted_at,
       metadata_version = excluded.metadata_version,
+      route_scope = excluded.route_scope,
+      public_url = excluded.public_url,
       state = excluded.state,
       sync_state = excluded.sync_state,
       reconcile_status = excluded.reconcile_status,
@@ -390,7 +422,8 @@ const stmts = {
   countRoutesVisible: db.prepare(`
     SELECT COUNT(*) AS count
     FROM routes
-    WHERE state = 'ACTIVE'
+    WHERE route_scope = 'main'
+      AND state = 'ACTIVE'
       AND deleted_at IS NULL
   `),
   listBucketsFromVisibleRoutes: db.prepare(`
@@ -399,7 +432,8 @@ const stmts = {
       MIN(uploaded_at) AS first_uploaded_at,
       MAX(COALESCE(updated_at, uploaded_at)) AS last_updated_at
     FROM routes
-    WHERE state = 'ACTIVE'
+    WHERE route_scope = 'main'
+      AND state = 'ACTIVE'
       AND deleted_at IS NULL
       AND COALESCE(bucket, '') != ''
     GROUP BY bucket
@@ -407,7 +441,8 @@ const stmts = {
   listVisibleObjectsPage: db.prepare(`
     SELECT *
     FROM routes
-    WHERE bucket = @bucket
+    WHERE route_scope = 'main'
+      AND bucket = @bucket
       AND state = 'ACTIVE'
       AND deleted_at IS NULL
       AND object_key >= @lower_bound
@@ -417,7 +452,17 @@ const stmts = {
   listRoutesByBucket: db.prepare(`
     SELECT *
     FROM routes
-    WHERE bucket = @bucket
+    WHERE route_scope = 'main'
+      AND bucket = @bucket
+      AND object_key LIKE @prefix || '%'
+    ORDER BY object_key ASC, encoded_key ASC
+  `),
+  listPublicRoutes: db.prepare(`
+    SELECT *
+    FROM routes
+    WHERE route_scope = 'public'
+      AND state = 'ACTIVE'
+      AND deleted_at IS NULL
       AND object_key LIKE @prefix || '%'
     ORDER BY object_key ASC, encoded_key ASC
   `),
@@ -464,14 +509,16 @@ const stmts = {
   activeObjectStatsByBucket: db.prepare(`
     SELECT bucket, COUNT(*) AS object_count, COALESCE(SUM(size_bytes), 0) AS total_bytes
     FROM routes
-    WHERE state = 'ACTIVE'
+    WHERE route_scope = 'main'
+      AND state = 'ACTIVE'
       AND deleted_at IS NULL
     GROUP BY bucket
   `),
   logicalBytesByBucketAccount: db.prepare(`
     SELECT bucket, account_id, COALESCE(SUM(size_bytes), 0) AS total_bytes
     FROM routes
-    WHERE state = 'ACTIVE'
+    WHERE route_scope = 'main'
+      AND state = 'ACTIVE'
       AND deleted_at IS NULL
     GROUP BY bucket, account_id
   `),
@@ -495,6 +542,7 @@ export function upsertAccount(account) {
     email_owner: account.email_owner ?? '',
     supabase_access_token: account.supabase_access_token ?? '',
     supabase_access_token_exp: account.supabase_access_token_exp ?? null,
+    public_bucket: account.public_bucket ? 1 : 0,
     quota_bytes: account.quota_bytes ?? 5_368_709_120,
     used_bytes: account.used_bytes ?? 0,
     active: account.active ?? 1,
@@ -556,6 +604,10 @@ export function deleteCronJob(jobId) {
 
 export function getBucket(bucket) {
   return stmts.getBucket.get(bucket)
+}
+
+export function getAllBuckets() {
+  return stmts.getAllBuckets.all()
 }
 
 export function listActiveBuckets() {
@@ -639,7 +691,8 @@ export function upsertRoute(route) {
   const normalized = normalizeRouteForWrite(route, existing)
   stmts.upsertRoute.run(normalized)
 
-  if (normalized.bucket
+  if (normalized.route_scope === ROUTE_SCOPE.MAIN
+      && normalized.bucket
       && normalized.state === ROUTE_STATE.ACTIVE
       && (normalized.deleted_at === null || normalized.deleted_at === undefined)) {
     ensureBucketActive(normalized.bucket, normalized.updated_at ?? Date.now())
@@ -664,6 +717,10 @@ export function getAllRoutes() {
 
 export function listRoutesByBucket(bucket, prefix = '') {
   return stmts.listRoutesByBucket.all({ bucket, prefix })
+}
+
+export function listPublicRoutes(prefix = '') {
+  return stmts.listPublicRoutes.all({ prefix })
 }
 
 export function listVisibleObjectsPage(bucket, { lowerBound = '', limit = 1000 } = {}) {
@@ -738,12 +795,16 @@ function withVersion(existing, nextUpdatedAt = Date.now()) {
 export const commitUploadedObjectMetadata = db.transaction((route) => {
   const existing = stmts.getRoute.get(route.encoded_key)
   const now = Date.now()
+  const routeScope = route.route_scope ?? existing?.route_scope ?? ROUTE_SCOPE.MAIN
 
-  ensureBucketActive(route.bucket, now)
+  if (routeScope === ROUTE_SCOPE.MAIN) {
+    ensureBucketActive(route.bucket, now)
+  }
 
   const { metadataVersion, updatedAt } = withVersion(existing, now)
   const normalized = normalizeRouteForWrite({
     ...route,
+    route_scope: routeScope,
     deleted_at: null,
     state: ROUTE_STATE.ACTIVE,
     sync_state: ROUTE_SYNC_STATE.PENDING_SYNC,
@@ -898,6 +959,20 @@ export const upsertReconciledRoute = db.transaction((route) => {
 
   stmts.upsertRoute.run(normalized)
   return stmts.getRoute.get(normalized.encoded_key)
+})
+
+export const upsertBucketRecord = db.transaction((bucketRow) => {
+  const now = Date.now()
+  const existing = stmts.getBucket.get(bucketRow.bucket)
+  stmts.upsertBucket.run({
+    bucket: bucketRow.bucket,
+    created_at: toTimestamp(bucketRow.created_at, existing?.created_at ?? now),
+    updated_at: toTimestamp(bucketRow.updated_at, now),
+    deleted_at: toNullableTimestamp(bucketRow.deleted_at ?? existing?.deleted_at ?? null),
+    versioning_status: bucketRow.versioning_status ?? existing?.versioning_status ?? BUCKET_VERSIONING_STATUS.NONE,
+  })
+
+  return stmts.getBucket.get(bucketRow.bucket)
 })
 
 export function upsertMultipartUpload(upload) {

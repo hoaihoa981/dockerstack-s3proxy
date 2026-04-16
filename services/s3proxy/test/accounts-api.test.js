@@ -219,6 +219,7 @@ async function testSingleAccountImport(fastify) {
         emailOwner: 'owner01@example.com',
         supabaseAccessToken: 'sbp_fe0648851adf6768514af4249fdb8e036e515318',
         supabaseAccessTokenExp: 'sbp_v0_4775ac9f7392aa585913d7da5bbf60051480b68e',
+        publicBucket: true,
         addressingStyle: 'virtual',
         payloadSigningMode: 'signed',
       },
@@ -233,6 +234,7 @@ async function testSingleAccountImport(fastify) {
     assert(body.accounts[0].hasSecret === true, `single import hasSecret=${body.accounts[0].hasSecret}`)
     assert(body.accounts[0].addressingStyle === 'virtual', `single import addressingStyle=${body.accounts[0].addressingStyle}`)
     assert(body.accounts[0].payloadSigningMode === 'signed', `single import payloadSigningMode=${body.accounts[0].payloadSigningMode}`)
+    assert(body.accounts[0].publicBucket === true, `single import publicBucket=${body.accounts[0].publicBucket}`)
     assert(body.accounts[0].emailOwner === 'owner01@example.com', `single import emailOwner=${body.accounts[0].emailOwner}`)
     assert(body.accounts[0].hasSupabaseAccessToken === true, `single import hasSupabaseAccessToken=${body.accounts[0].hasSupabaseAccessToken}`)
     assert(
@@ -244,6 +246,7 @@ async function testSingleAccountImport(fastify) {
     assert(fakeRtdb.state.accounts.acc01?.accountId === 'acc01', 'single import missing accountId in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.addressingStyle === 'virtual', 'single import missing addressingStyle in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.payloadSigningMode === 'signed', 'single import missing payloadSigningMode in fake RTDB')
+    assert(fakeRtdb.state.accounts.acc01?.publicBucket === true, 'single import missing publicBucket in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.emailOwner === 'owner01@example.com', 'single import missing emailOwner in fake RTDB')
     assert(fakeRtdb.state.accounts.acc01?.supabaseAccessToken === 'sbp_fe0648851adf6768514af4249fdb8e036e515318', 'single import missing supabaseAccessToken in fake RTDB')
     assert(

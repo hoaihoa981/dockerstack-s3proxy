@@ -195,6 +195,10 @@
       <input id="accountEndpoint" class="span2" placeholder="endpoint (https://...)" required />
       <input id="accountRegion" placeholder="region (Supabase: us-east-1 hoặc auto)" required />
       <input id="accountBucket" placeholder="bucket" required />
+      <select id="accountPublicBucket">
+        <option value="false">private backend</option>
+        <option value="true">public backend</option>
+      </select>
       <input id="accountEmailOwner" placeholder="emailOwner" />
       <input id="accountSupabaseAccessToken" placeholder="supabaseAccessToken (sbp_...)" />
       <input id="accountSupabaseAccessTokenExp" placeholder="supabaseAccessTokenExp (experimental sbp_...)" />
@@ -216,7 +220,7 @@
       <button type="submit">Lưu account</button>
       <button type="button" id="accountResetBtn" class="secondary">Clear form</button>
     </form>
-    <p class="hint">Edit: bấm edit để nạp dữ liệu; `secretAccessKey`, `supabaseAccessToken`, `supabaseAccessTokenExp` để trống sẽ giữ giá trị cũ.</p>
+    <p class="hint">Edit: bấm edit để nạp dữ liệu; `secretAccessKey`, `supabaseAccessToken`, `supabaseAccessTokenExp` để trống sẽ giữ giá trị cũ. Nếu backend được bật `public`, luồng upload chính sẽ tự loại trừ backend này khỏi vòng quay.</p>
 
     <div class="table-wrap">
     <table class="responsive-table">
@@ -224,6 +228,39 @@
       <tbody id="accountsBody"></tbody>
     </table>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>Public Bucket Proxy</h2>
+    <form id="publicFileForm">
+      <input id="publicFilePath" class="span2" placeholder="Đường dẫn file public (vd: images/banner.png)" />
+      <input id="publicFileContentType" placeholder="contentType override (optional)" />
+      <input id="publicFileInput" type="file" />
+      <button type="submit">Upload / Replace file public</button>
+      <button type="button" id="publicFileResetBtn" class="secondary">Clear form</button>
+    </form>
+    <div class="actions">
+      <button id="publicFileRefreshBtn" class="secondary">Refresh file public</button>
+    </div>
+    <p class="hint">API `public-bucket-proxy` sẽ chỉ lưu lên các backend được đánh dấu public và trả direct link backend để có thể dùng ngay cả khi proxy hiện tại down.</p>
+
+    <div class="table-wrap">
+    <table class="responsive-table">
+      <thead><tr><th>Path</th><th>Backend</th><th>Meta</th><th>Direct Link</th><th>Updated</th><th>Action</th></tr></thead>
+      <tbody id="publicFilesBody"></tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Import / Export Runtime</h2>
+    <div class="actions">
+      <button id="runtimeExportBtn">Export runtime JSON</button>
+      <input id="runtimeImportFile" type="file" accept=".json,application/json" />
+      <button id="runtimeImportBtn" class="secondary">Import runtime JSON</button>
+    </div>
+    <p class="hint">Chỉ import/export metadata runtime: accounts, buckets, routes, public direct links. Không chứa nội dung file đã lưu trong S3 backend.</p>
+    <pre id="runtimeIoLog">(chưa thao tác)</pre>
   </section>
 
   <section class="card">
@@ -255,6 +292,14 @@ const installHint = document.getElementById('installHint')
 const cronForm = document.getElementById('cronForm')
 const accountForm = document.getElementById('accountForm')
 const accountResetBtn = document.getElementById('accountResetBtn')
+const publicFileForm = document.getElementById('publicFileForm')
+const publicFilesBody = document.getElementById('publicFilesBody')
+const publicFileRefreshBtn = document.getElementById('publicFileRefreshBtn')
+const publicFileResetBtn = document.getElementById('publicFileResetBtn')
+const runtimeExportBtn = document.getElementById('runtimeExportBtn')
+const runtimeImportBtn = document.getElementById('runtimeImportBtn')
+const runtimeImportFile = document.getElementById('runtimeImportFile')
+const runtimeIoLog = document.getElementById('runtimeIoLog')
 const accountServiceKindsEl = document.getElementById('accountServiceKinds')
 const accountServiceBucketNameEl = document.getElementById('accountServiceBucketName')
 const accountServiceRawInputEl = document.getElementById('accountServiceRawInput')
@@ -291,6 +336,34 @@ function fmtTokenPreview(tokenValue) {
   if (!token) return '-'
   if (token.length <= 18) return token
   return `${token.slice(0, 12)}...${token.slice(-6)}`
+}
+
+function encodePathForUrl(path) {
+  return String(path || '')
+    .split('/')
+    .filter((segment) => segment !== '')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+}
+
+async function copyText(value) {
+  const text = String(value || '').trim()
+  if (!text) throw new Error('Không có dữ liệu để copy')
+
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const input = document.createElement('textarea')
+  input.value = text
+  input.setAttribute('readonly', 'readonly')
+  input.style.position = 'fixed'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+  input.select()
+  document.execCommand('copy')
+  document.body.removeChild(input)
 }
 
 function selectedServiceKinds() {
@@ -369,6 +442,7 @@ function resetAccountForm() {
   document.getElementById('accountEndpoint').value = ''
   document.getElementById('accountRegion').value = ''
   document.getElementById('accountBucket').value = ''
+  document.getElementById('accountPublicBucket').value = 'false'
   document.getElementById('accountEmailOwner').value = ''
   document.getElementById('accountSupabaseAccessToken').value = ''
   document.getElementById('accountSupabaseAccessTokenExp').value = ''
@@ -387,6 +461,7 @@ function fillAccountForm(account) {
   document.getElementById('accountEndpoint').value = account.endpoint || ''
   document.getElementById('accountRegion').value = account.region || ''
   document.getElementById('accountBucket').value = account.bucket || ''
+  document.getElementById('accountPublicBucket').value = String(Boolean(account.publicBucket))
   document.getElementById('accountEmailOwner').value = account.emailOwner || ''
   document.getElementById('accountSupabaseAccessToken').value = ''
   document.getElementById('accountSupabaseAccessTokenExp').value = account.supabaseAccessTokenExp ? String(account.supabaseAccessTokenExp) : ''
@@ -406,6 +481,7 @@ function applyAccountDraft(draft) {
   if (draft.endpoint) document.getElementById('accountEndpoint').value = draft.endpoint
   if (draft.region) document.getElementById('accountRegion').value = draft.region
   if (draft.bucket) document.getElementById('accountBucket').value = draft.bucket
+  if (draft.publicBucket !== undefined) document.getElementById('accountPublicBucket').value = String(Boolean(draft.publicBucket))
   if (draft.emailOwner) document.getElementById('accountEmailOwner').value = draft.emailOwner
   if (draft.supabaseAccessToken) document.getElementById('accountSupabaseAccessToken').value = draft.supabaseAccessToken
   if (draft.supabaseAccessTokenExp) document.getElementById('accountSupabaseAccessTokenExp').value = String(draft.supabaseAccessTokenExp)
@@ -420,6 +496,7 @@ function buildAccountPayloadFromForm() {
   const endpoint = document.getElementById('accountEndpoint').value.trim()
   const region = document.getElementById('accountRegion').value.trim()
   const bucket = document.getElementById('accountBucket').value.trim()
+  const publicBucket = document.getElementById('accountPublicBucket').value === 'true'
   const emailOwner = document.getElementById('accountEmailOwner').value.trim()
   const supabaseAccessToken = document.getElementById('accountSupabaseAccessToken').value.trim()
   const supabaseAccessTokenExp = document.getElementById('accountSupabaseAccessTokenExp').value.trim()
@@ -437,6 +514,7 @@ function buildAccountPayloadFromForm() {
     endpoint,
     region,
     bucket,
+    publicBucket,
     emailOwner: emailOwner || undefined,
     supabaseAccessToken: supabaseAccessToken || undefined,
     supabaseAccessTokenExp: supabaseAccessTokenExp || undefined,
@@ -607,15 +685,49 @@ async function runServiceParseFlow() {
   }
 }
 
+function resetPublicFileForm() {
+  document.getElementById('publicFilePath').value = ''
+  document.getElementById('publicFileContentType').value = ''
+  document.getElementById('publicFileInput').value = ''
+}
+
+async function uploadPublicFile() {
+  const fileInput = document.getElementById('publicFileInput')
+  const pickedFile = fileInput.files && fileInput.files[0]
+  const filePath = (document.getElementById('publicFilePath').value.trim() || pickedFile?.name || '').replace(/^\/+/, '')
+  const contentType = document.getElementById('publicFileContentType').value.trim() || pickedFile?.type || 'application/octet-stream'
+
+  if (!filePath) {
+    throw new Error('Bạn cần nhập path hoặc chọn file để upload')
+  }
+  if (!pickedFile) {
+    throw new Error('Bạn cần chọn file để upload/replace')
+  }
+
+  const body = await api(`/public-bucket-proxy/files/${encodePathForUrl(filePath)}`, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'x-public-file-content-type': contentType,
+    },
+    body: pickedFile,
+  })
+
+  logEl.textContent = JSON.stringify(body, null, 2)
+  return body
+}
+
 async function refresh() {
   const body = await api('/admin/api/overview')
   const healthClass = body.status === 'ok' ? 'ok' : 'bad'
+  const publicBackendCount = body.accounts.filter((account) => account.publicBucket).length
 
   metaEl.innerHTML = `
     <div class="pill">Deploy version: <b>${body.deployVersion}</b></div>
     <div class="pill">Instance: <b>${body.instanceId}</b></div>
     <div class="pill">Status: <b class="${healthClass}">${body.status}</b></div>
     <div class="pill">Accounts active/total: <b>${body.stats.active}/${body.stats.total}</b></div>
+    <div class="pill">Public backends/files: <b>${publicBackendCount}/${body.publicFiles.length}</b></div>
     <div class="pill">Used total: <b>${fmtBytes(body.stats.usedBytes)} / ${fmtBytes(body.stats.totalBytes)}</b></div>
     <div class="pill">RTDB connected: <b>${body.rtdb.connected}</b> | listener: <b>${body.rtdb.listenerActive}</b></div>
   `
@@ -683,11 +795,11 @@ async function refresh() {
   accountsBody.innerHTML = body.accounts.map((account) => `
     <tr>
       <td data-label="Account">${account.accountId}<br/><span class="hint">${account.accessKeyId || '-'} | ${account.addressingStyle || 'path'} | ${account.payloadSigningMode || 'unsigned'}</span></td>
-      <td data-label="Endpoint/Bucket">${account.endpoint}<br/><span class="hint">${account.bucket}</span></td>
+      <td data-label="Endpoint/Bucket">${account.endpoint}<br/><span class="hint">${account.bucket} | backend=${account.publicBucket ? 'public' : 'private'}</span></td>
       <td data-label="Owner/Supabase">${account.emailOwner || '-'}<br/><span class="hint">token=${account.hasSupabaseAccessToken ? 'yes' : 'no'} | exp=${fmtTokenPreview(account.supabaseAccessTokenExp)}</span></td>
       <td data-label="Used/Quota">${fmtBytes(account.usedBytes)} / ${fmtBytes(account.quotaBytes)}</td>
       <td data-label="Percent">${account.usedPercent}%</td>
-      <td data-label="Status" class="${account.active ? 'ok' : 'bad'}">${account.active ? 'active' : 'inactive'}</td>
+      <td data-label="Status" class="${account.active ? 'ok' : 'bad'}">${account.active ? 'active' : 'inactive'}<br/><span class="hint">${account.publicBucket ? 'public-backend' : 'private-backend'}</span></td>
       <td data-label="Action">
         <button data-account-test="${account.accountId}">Test</button>
         <button class="secondary" data-account-edit="${account.accountId}">Edit</button>
@@ -729,6 +841,69 @@ async function refresh() {
         if (result.warning) {
           logEl.textContent = result.warning
         }
+        await refresh()
+      } catch (err) {
+        logEl.textContent = String(err)
+      }
+    })
+  })
+
+  publicFilesBody.innerHTML = body.publicFiles.map((file) => `
+    <tr>
+      <td data-label="Path">${file.path}</td>
+      <td data-label="Backend">${file.accountId}<br/><span class="hint">${file.backendKey}</span></td>
+      <td data-label="Meta">${fmtBytes(file.sizeBytes)}<br/><span class="hint">${file.contentType || '-'}</span></td>
+      <td data-label="Direct Link">${file.directUrl ? `<a href="${file.directUrl}" target="_blank" rel="noreferrer">${file.directUrl}</a>` : '-'}</td>
+      <td data-label="Updated">${fmtTime(file.updatedAt || file.uploadedAt)}</td>
+      <td data-label="Action">
+        <button class="secondary" data-public-edit="${encodeURIComponent(file.path)}">Use path</button>
+        <button data-public-copy="${encodeURIComponent(file.path)}">Copy link</button>
+        <button class="danger" data-public-delete="${encodeURIComponent(file.path)}">Delete</button>
+      </td>
+    </tr>
+  `).join('')
+
+  publicFilesBody.querySelectorAll('button[data-public-edit]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const path = decodeURIComponent(button.getAttribute('data-public-edit') || '')
+      const file = body.publicFiles.find((item) => item.path === path)
+      document.getElementById('publicFilePath').value = path
+      document.getElementById('publicFileContentType').value = file?.contentType || ''
+    })
+  })
+
+  publicFilesBody.querySelectorAll('button[data-public-copy]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const path = decodeURIComponent(button.getAttribute('data-public-copy') || '')
+      const file = body.publicFiles.find((item) => item.path === path)
+      try {
+        if (!file?.directUrl) throw new Error('File này chưa có direct link')
+        await copyText(file.directUrl)
+        logEl.textContent = `Đã copy direct link: ${file.directUrl}`
+      } catch (err) {
+        logEl.textContent = String(err)
+      }
+    })
+  })
+
+  publicFilesBody.querySelectorAll('button[data-public-delete]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const path = decodeURIComponent(button.getAttribute('data-public-delete') || '')
+      if (!path) return
+
+      const approved = await openModal({
+        title: 'Xác nhận xóa file public',
+        message: `Bạn có chắc muốn xóa file public "${path}"?`,
+        confirmText: 'Xóa',
+        cancelText: 'Giữ lại',
+        showCancel: true,
+        tone: 'warn',
+      })
+      if (!approved) return
+
+      try {
+        const result = await api(`/public-bucket-proxy/files/${encodePathForUrl(path)}`, { method: 'DELETE' })
+        logEl.textContent = JSON.stringify(result, null, 2)
         await refresh()
       } catch (err) {
         logEl.textContent = String(err)
@@ -813,6 +988,100 @@ accountForm.addEventListener('submit', async (event) => {
 
 accountResetBtn.addEventListener('click', () => {
   resetAccountForm()
+})
+
+publicFileForm.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  try {
+    const result = await uploadPublicFile()
+    resetPublicFileForm()
+    logEl.textContent = JSON.stringify(result, null, 2)
+    await refresh()
+  } catch (err) {
+    logEl.textContent = String(err)
+  }
+})
+
+publicFileResetBtn.addEventListener('click', () => {
+  resetPublicFileForm()
+})
+
+document.getElementById('publicFileInput').addEventListener('change', (event) => {
+  const file = event.target.files && event.target.files[0]
+  if (!file) return
+
+  const pathEl = document.getElementById('publicFilePath')
+  const contentTypeEl = document.getElementById('publicFileContentType')
+  if (!pathEl.value.trim()) pathEl.value = file.name
+  if (!contentTypeEl.value.trim() && file.type) contentTypeEl.value = file.type
+})
+
+publicFileRefreshBtn.addEventListener('click', async () => {
+  try {
+    await refresh()
+  } catch (err) {
+    logEl.textContent = String(err)
+  }
+})
+
+runtimeExportBtn.addEventListener('click', async () => {
+  runtimeIoLog.textContent = 'Đang export runtime JSON...'
+  try {
+    const res = await fetch('/admin/api/runtime-export')
+    const blob = await res.blob()
+    if (!res.ok) {
+      throw new Error(await blob.text())
+    }
+
+    const disposition = res.headers.get('content-disposition') || ''
+    const match = disposition.match(/filename="([^"]+)"/i)
+    const filename = match?.[1] || `s3proxy-runtime-export-${Date.now()}.json`
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+
+    runtimeIoLog.textContent = `Đã export runtime JSON: ${filename}`
+  } catch (err) {
+    runtimeIoLog.textContent = String(err)
+  }
+})
+
+runtimeImportBtn.addEventListener('click', async () => {
+  const file = runtimeImportFile.files && runtimeImportFile.files[0]
+  if (!file) {
+    runtimeIoLog.textContent = 'Bạn cần chọn file JSON để import.'
+    return
+  }
+
+  const approved = await openModal({
+    title: 'Xác nhận import runtime',
+    message: 'Import sẽ merge metadata runtime vào instance hiện tại (accounts, buckets, routes, direct links). Không upload lại nội dung file lên S3. Bạn có muốn tiếp tục không?',
+    confirmText: 'Import',
+    cancelText: 'Hủy',
+    showCancel: true,
+    tone: 'warn',
+  })
+  if (!approved) return
+
+  runtimeIoLog.textContent = 'Đang import runtime JSON...'
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const result = await api('/admin/api/runtime-import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    runtimeIoLog.textContent = JSON.stringify(result, null, 2)
+    await refresh()
+  } catch (err) {
+    runtimeIoLog.textContent = String(err)
+  }
 })
 
 installBtn.addEventListener('click', async () => {

@@ -20,7 +20,13 @@ import {
   deleteAccount,
   getAccountById,
   getAllAccounts,
+  getAllBuckets,
+  getAllRoutes,
   getTrackedRoutesByAccount,
+  listPublicRoutes,
+  ROUTE_SCOPE,
+  upsertBucketRecord,
+  upsertRoute,
   upsertAccount,
 } from '../db.js'
 import { getAccountsStats, reloadAccountsFromRTDB, reloadAccountsFromSQLite } from '../accountPool.js'
@@ -42,6 +48,8 @@ import {
   normalizeSupabaseAccessTokenExp,
   previewSupabaseS3,
 } from '../supabaseS3.js'
+import { buildRtdbRouteDocument, encodeKey, PUBLIC_PROXY_BUCKET } from '../metadata.js'
+import { buildDirectPublicObjectUrl } from '../publicObjectUrl.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const adminHtml = readFileSync(join(__dirname, '..', 'admin-ui.html'), 'utf-8')
@@ -97,6 +105,7 @@ function toPublicAccount(row) {
     endpoint: row.endpoint,
     region: row.region,
     bucket: row.bucket,
+    publicBucket: row.public_bucket === 1 || row.public_bucket === true,
     addressingStyle: row.addressing_style ?? 'path',
     payloadSigningMode: row.payload_signing_mode ?? 'unsigned',
     emailOwner: row.email_owner ?? '',
@@ -239,6 +248,7 @@ function toSafeAccountLog(row) {
     endpoint: row.endpoint,
     region: row.region,
     bucket: row.bucket,
+    publicBucket: row.public_bucket === 1 || row.public_bucket === true,
     addressingStyle: row.addressing_style ?? 'path',
     payloadSigningMode: row.payload_signing_mode ?? 'unsigned',
     emailOwner: row.email_owner ?? '',
@@ -270,6 +280,7 @@ function toIncomingAccountLog(payload) {
     endpoint: normalizeString(payload.endpoint),
     region: normalizeString(payload.region),
     bucket: normalizeString(payload.bucket),
+    publicBucket: normalizeBoolean(payload.publicBucket ?? payload.public_bucket, false),
     hasAccessKeyId: Boolean(normalizeString(payload.accessKeyId ?? payload.access_key_id)),
     hasSecretAccessKey: Boolean(normalizeString(payload.secretAccessKey ?? payload.secret_key)),
     hasEmailOwner: Boolean(normalizeString(readAccountField(payload, '', ['emailOwner', 'email_owner', 'supabase.emailOwner']))),
@@ -303,10 +314,40 @@ function toRtdbAccountDocument(account) {
       accessTokenExp: account.supabase_access_token_exp ?? null,
       accessTokenExperimental: account.supabase_access_token_exp ?? null,
     },
+    publicBucket: account.public_bucket === 1,
     quotaBytes: account.quota_bytes,
     usedBytes: account.used_bytes,
     active: account.active === 1,
     addedAt: account.added_at,
+  }
+}
+
+function toPrivateExportAccount(account) {
+  return {
+    account_id: account.account_id,
+    access_key_id: account.access_key_id,
+    secret_key: account.secret_key,
+    endpoint: account.endpoint,
+    region: account.region,
+    bucket: account.bucket,
+    public_bucket: account.public_bucket === 1 || account.public_bucket === true ? 1 : 0,
+    addressing_style: account.addressing_style ?? 'path',
+    payload_signing_mode: account.payload_signing_mode ?? 'unsigned',
+    email_owner: account.email_owner ?? '',
+    supabase_access_token: account.supabase_access_token ?? '',
+    supabase_access_token_exp: account.supabase_access_token_exp ?? null,
+    quota_bytes: account.quota_bytes ?? 0,
+    used_bytes: account.used_bytes ?? 0,
+    active: account.active === 1 || account.active === true ? 1 : 0,
+    added_at: account.added_at ?? Date.now(),
+  }
+}
+
+function toRuntimeExportRoute(route) {
+  return {
+    ...route,
+    route_scope: route.route_scope ?? ROUTE_SCOPE.MAIN,
+    public_url: route.public_url ?? null,
   }
 }
 
@@ -374,6 +415,10 @@ function normalizeAccountPayload(payload, existing = null) {
     'quotaBytes',
     errors,
   )
+  const publicBucket = normalizeBoolean(
+    payload.publicBucket ?? payload.public_bucket,
+    existing ? (existing.public_bucket === 1 || existing.public_bucket === true) : false,
+  ) ? 1 : 0
   const usedBytes = normalizeNonNegativeInteger(
     payload.usedBytes ?? payload.used_bytes,
     existing?.used_bytes ?? 0,
@@ -433,6 +478,7 @@ function normalizeAccountPayload(payload, existing = null) {
       email_owner: emailOwner,
       supabase_access_token: supabaseAccessToken,
       supabase_access_token_exp: supabaseAccessTokenExp,
+      public_bucket: publicBucket,
       quota_bytes: quotaBytes,
       used_bytes: usedBytes,
       active,
@@ -563,6 +609,29 @@ function parseBodyObject(body) {
   return body
 }
 
+function toAdminPublicFile(route) {
+  const account = getAccountById(route.account_id)
+  const directUrl = route.public_url ?? buildDirectPublicObjectUrl(account, route.backend_key)
+
+  return {
+    path: route.object_key,
+    encodedKey: route.encoded_key,
+    backendKey: route.backend_key,
+    bucket: route.bucket ?? PUBLIC_PROXY_BUCKET,
+    directUrl,
+    accountId: route.account_id,
+    contentType: route.content_type ?? 'application/octet-stream',
+    sizeBytes: route.size_bytes ?? 0,
+    etag: route.etag ?? null,
+    uploadedAt: route.uploaded_at ?? null,
+    updatedAt: route.updated_at ?? null,
+    lastModified: route.last_modified ?? null,
+    metadataVersion: route.metadata_version ?? 1,
+    routeScope: route.route_scope ?? ROUTE_SCOPE.PUBLIC,
+    state: route.state,
+  }
+}
+
 export default async function adminRoutes(fastify, _opts) {
   fastify.get('/admin', {
     config: { skipAuth: true },
@@ -608,6 +677,7 @@ export default async function adminRoutes(fastify, _opts) {
   }, async (_request, reply) => {
     const stats = getAccountsStats()
     const accounts = getAllAccounts().map(toPublicAccount)
+    const publicFiles = listPublicRoutes().map(toAdminPublicFile)
     const rtdb = getRtdbState()
 
     reply.send({
@@ -619,6 +689,7 @@ export default async function adminRoutes(fastify, _opts) {
       jobs: listCronJobs(),
       cronKinds: getCronJobKinds(),
       accounts,
+      publicFiles,
     })
   })
 
@@ -889,6 +960,153 @@ export default async function adminRoutes(fastify, _opts) {
     return reply.send({
       ok: true,
       accountId,
+      rtdbSynced,
+      warning: warning || undefined,
+    })
+  })
+
+  fastify.get('/admin/api/runtime-export', {
+    config: { skipAuth: true },
+  }, async (_request, reply) => {
+    const snapshot = {
+      version: 1,
+      exportedAt: Date.now(),
+      instanceId: config.INSTANCE_ID,
+      accounts: getAllAccounts().map(toPrivateExportAccount),
+      buckets: getAllBuckets(),
+      routes: getAllRoutes().map(toRuntimeExportRoute),
+    }
+
+    reply
+      .header('Content-Type', 'application/json; charset=utf-8')
+      .header('Content-Disposition', `attachment; filename="s3proxy-runtime-export-${Date.now()}.json"`)
+      .send(snapshot)
+  })
+
+  fastify.post('/admin/api/runtime-import', {
+    config: { skipAuth: true },
+  }, async (request, reply) => {
+    const payload = parseBodyObject(request.body)
+    const accountsInput = Array.isArray(payload.accounts)
+      ? payload.accounts
+      : Object.values(payload.accounts ?? {})
+    const bucketsInput = Array.isArray(payload.buckets)
+      ? payload.buckets
+      : Object.values(payload.buckets ?? {})
+    const routesInput = Array.isArray(payload.routes)
+      ? payload.routes
+      : Object.values(payload.routes ?? {})
+
+    if (accountsInput.length === 0 && bucketsInput.length === 0 && routesInput.length === 0) {
+      return reply.code(400).send({
+        ok: false,
+        error: 'Payload must contain at least one of: accounts, buckets, routes',
+      })
+    }
+
+    const importedAccounts = []
+    for (const account of accountsInput) {
+      if (!account || typeof account !== 'object') continue
+      const normalized = toPrivateExportAccount({
+        ...account,
+        account_id: account.account_id ?? account.accountId,
+        access_key_id: account.access_key_id ?? account.accessKeyId,
+        secret_key: account.secret_key ?? account.secretAccessKey,
+        addressing_style: account.addressing_style ?? account.addressingStyle,
+        payload_signing_mode: account.payload_signing_mode ?? account.payloadSigningMode,
+        email_owner: account.email_owner ?? account.emailOwner,
+        supabase_access_token: account.supabase_access_token ?? account.supabaseAccessToken,
+        supabase_access_token_exp: account.supabase_access_token_exp
+          ?? account.supabaseAccessTokenExp
+          ?? account.supabaseAccessTokenExperimental,
+        public_bucket: account.public_bucket ?? account.publicBucket,
+        quota_bytes: account.quota_bytes ?? account.quotaBytes,
+        used_bytes: account.used_bytes ?? account.usedBytes,
+        added_at: account.added_at ?? account.addedAt,
+      })
+      if (!normalized.account_id) continue
+      upsertAccount(normalized)
+      importedAccounts.push(normalized)
+    }
+
+    const importedBuckets = []
+    for (const bucket of bucketsInput) {
+      if (!bucket || typeof bucket !== 'object' || !bucket.bucket) continue
+      importedBuckets.push(upsertBucketRecord({
+        bucket: bucket.bucket,
+        created_at: bucket.created_at ?? bucket.createdAt,
+        updated_at: bucket.updated_at ?? bucket.updatedAt,
+        deleted_at: bucket.deleted_at ?? bucket.deletedAt ?? null,
+        versioning_status: bucket.versioning_status ?? bucket.versioningStatus ?? '',
+      }))
+    }
+
+    const importedRoutes = []
+    for (const route of routesInput) {
+      if (!route || typeof route !== 'object') continue
+      const normalized = {
+        ...route,
+        encoded_key: route.encoded_key
+          ?? route.encodedKey
+          ?? (route.bucket && route.object_key ? encodeKey(route.bucket, route.object_key) : null),
+        account_id: route.account_id ?? route.accountId,
+        object_key: route.object_key ?? route.objectKey,
+        backend_key: route.backend_key ?? route.backendKey,
+        size_bytes: route.size_bytes ?? route.sizeBytes ?? 0,
+        last_modified: route.last_modified ?? route.lastModified ?? route.uploaded_at ?? route.uploadedAt ?? Date.now(),
+        content_type: route.content_type ?? route.contentType ?? null,
+        uploaded_at: route.uploaded_at ?? route.uploadedAt ?? Date.now(),
+        updated_at: route.updated_at ?? route.updatedAt ?? Date.now(),
+        deleted_at: route.deleted_at ?? route.deletedAt ?? null,
+        metadata_version: route.metadata_version ?? route.metadataVersion ?? 1,
+        route_scope: route.route_scope ?? route.routeScope ?? ROUTE_SCOPE.MAIN,
+        public_url: route.public_url ?? route.publicUrl ?? null,
+        state: route.state ?? ROUTE_STATE.ACTIVE,
+        sync_state: route.sync_state ?? route.syncState ?? 'PENDING_SYNC',
+        reconcile_status: route.reconcile_status ?? route.reconcileStatus ?? ROUTE_RECONCILE_STATUS.HEALTHY,
+        backend_last_seen_at: route.backend_last_seen_at ?? route.backendLastSeenAt ?? null,
+        backend_missing_since: route.backend_missing_since ?? route.backendMissingSince ?? null,
+        last_reconciled_at: route.last_reconciled_at ?? route.lastReconciledAt ?? null,
+        instance_id: route.instance_id ?? route.instanceId ?? config.INSTANCE_ID,
+      }
+
+      if (!normalized.encoded_key || !normalized.account_id || !normalized.bucket || !normalized.object_key) {
+        continue
+      }
+
+      upsertRoute(normalized)
+      importedRoutes.push(normalized)
+    }
+
+    reloadAccountsFromSQLite()
+
+    let rtdbSynced = true
+    let warning = ''
+    try {
+      const updates = {
+        ...Object.fromEntries(importedAccounts.map((account) => [buildRtdbAccountPath(account.account_id), toRtdbAccountDocument(account)])),
+        ...Object.fromEntries(importedRoutes.map((route) => [`/routes/${route.encoded_key}`, buildRtdbRouteDocument(route)])),
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await rtdbBatchPatch(updates)
+        await reloadAccountsFromRTDB()
+      }
+    } catch (err) {
+      rtdbSynced = false
+      warning = `Runtime metadata imported locally, but RTDB sync failed: ${err?.message ?? String(err)}`
+      request.log.warn({ err }, 'runtime import RTDB sync failed')
+      reloadAccountsFromSQLite()
+    }
+
+    return reply.send({
+      ok: true,
+      imported: {
+        accounts: importedAccounts.length,
+        buckets: importedBuckets.length,
+        routes: importedRoutes.length,
+        publicFiles: importedRoutes.filter((route) => route.route_scope === ROUTE_SCOPE.PUBLIC).length,
+      },
       rtdbSynced,
       warning: warning || undefined,
     })

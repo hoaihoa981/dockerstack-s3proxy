@@ -3,7 +3,6 @@
 # Supports both ubuntu-latest and windows-latest runners.
 
 name: dockerstack-s3proxy
-
 on:
   workflow_dispatch:
   # schedule:

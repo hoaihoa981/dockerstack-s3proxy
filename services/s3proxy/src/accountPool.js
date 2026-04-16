@@ -79,9 +79,23 @@ export function syncAccountFromDb(accountId) {
   return row
 }
 
-export function selectAccountForUpload(sizeBytes, excludeIds = new Set()) {
+function isPublicBucketAccount(account) {
+  return account?.public_bucket === 1 || account?.public_bucket === true
+}
+
+export function selectAccountForUpload(sizeBytes, options = {}) {
+  const excludeIds = options.excludeIds instanceof Set
+    ? options.excludeIds
+    : new Set(options.excludeIds ?? [])
+  const publicBucket = options.publicBucket === true
+
   for (const account of activeAccounts) {
     if (excludeIds.has(account.account_id)) continue
+    if (publicBucket) {
+      if (!isPublicBucketAccount(account)) continue
+    } else if (isPublicBucketAccount(account)) {
+      continue
+    }
 
     const projected = (account.used_bytes + sizeBytes) / account.quota_bytes
     if (projected < config.QUOTA_THRESHOLD) {
@@ -90,7 +104,7 @@ export function selectAccountForUpload(sizeBytes, excludeIds = new Set()) {
   }
 
   throw new StorageFullError(
-    `No account can accept ${sizeBytes} bytes (threshold: ${config.QUOTA_THRESHOLD * 100}%)`
+    `${publicBucket ? 'No public backend' : 'No private backend'} can accept ${sizeBytes} bytes (threshold: ${config.QUOTA_THRESHOLD * 100}%)`
   )
 }
 
@@ -149,6 +163,9 @@ export async function reloadAccountsFromRTDB() {
             ?? supabase.accessToken?.experimental
             ?? supabase.accessToken?.exp,
           ),
+          public_bucket: data.publicBucket
+            ?? data.public_bucket
+            ?? false,
           quota_bytes: data.quotaBytes ?? 5_368_709_120,
           used_bytes: data.usedBytes ?? 0,
           active: data.active ? 1 : 0,
