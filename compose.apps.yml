@@ -16,6 +16,8 @@ services:
     build:
       context: ./services/s3proxy
       dockerfile: Dockerfile
+    env_file:
+      - ./.env
     environment:
       NODE_ENV: "${NODE_ENV:-production}"
       PORT: "${APP_PORT:-3000}"
@@ -49,6 +51,24 @@ services:
       # Joplin/S3 clients use SigV4 auth headers and cannot send x-api-key directly.
       # Keep compatibility ON by default; set to "false" for strict header-only auth mode.
       ALLOW_INSECURE_SIGV4_KEY_EXTRACT: "${S3PROXY_ALLOW_INSECURE_SIGV4_KEY_EXTRACT:-true}"
+      # Runner
+      # _DOTENVRTDB_RUNNER_HOST_TYPE: "${_DOTENVRTDB_RUNNER_HOST_TYPE:-}"
+      # _DOTENVRTDB_RUNNER_REPO: "${_DOTENVRTDB_RUNNER_REPO:-}"
+      # _DOTENVRTDB_RUNNER_ORG: "${_DOTENVRTDB_RUNNER_ORG:-}"
+      # _DOTENVRTDB_RUNNER_RUN_ID: "${_DOTENVRTDB_RUNNER_RUN_ID:-}"
+      # _DOTENVRTDB_RUNNER_RUN_ATTEMPT: "${_DOTENVRTDB_RUNNER_RUN_ATTEMPT:-}"
+      # _DOTENVRTDB_RUNNER_JOB: "${_DOTENVRTDB_RUNNER_JOB:-}"
+      # _DOTENVRTDB_RUNNER_WORKFLOW: "${_DOTENVRTDB_RUNNER_WORKFLOW:-}"
+      # _DOTENVRTDB_RUNNER_PIPELINE: "${_DOTENVRTDB_RUNNER_PIPELINE:-}"
+      # _DOTENVRTDB_RUNNER_WORKFLOW_FILE: "${_DOTENVRTDB_RUNNER_WORKFLOW_FILE:-}"
+      # _DOTENVRTDB_RUNNER_OS: "${_DOTENVRTDB_RUNNER_OS:-}"
+      # _DOTENVRTDB_RUNNER_ARCH: "${_DOTENVRTDB_RUNNER_ARCH:-}"
+      # _DOTENVRTDB_RUNNER_HOSTNAME: "${_DOTENVRTDB_RUNNER_HOSTNAME:-}"
+      # _DOTENVRTDB_RUNNER_ACTOR: "${_DOTENVRTDB_RUNNER_ACTOR:-}"
+      # _DOTENVRTDB_RUNNER_BRANCH: "${_DOTENVRTDB_RUNNER_BRANCH:-}"
+      # _DOTENVRTDB_RUNNER_EVENT: "${_DOTENVRTDB_RUNNER_EVENT:-}"
+      # _DOTENVRTDB_RUNNER_SHA: "${_DOTENVRTDB_RUNNER_SHA:-}"
+      # _DOTENVRTDB_RUNNER_SERVER_URL: "${_DOTENVRTDB_RUNNER_SERVER_URL:-}"
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-3000}:${APP_PORT:-3000}"
     volumes:
