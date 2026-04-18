@@ -57,6 +57,57 @@ function shortHostnameFromValue(value) {
   return first || v;
 }
 
+function trimLeadingTrailingDots(value) {
+  return String(value || "").replace(/^\.+/, "").replace(/\.+$/, "");
+}
+
+function ensureServeConfigFileFromEnv() {
+  // Template to keep in code so we can tweak structure later without touching replacement logic.
+  const serveConfigTemplate = {
+    TCP: {
+      "443": {
+        HTTPS: true,
+      },
+    },
+    Web: {
+      "dockerstacks3proxy.tail03fb4e.ts.net:443": {
+        Handlers: {
+          "/": {
+            Proxy: "http://127.0.0.1:80",
+          },
+        },
+      },
+    },
+  };
+
+  const projectName = trimLeadingTrailingDots(
+    normalizeHostLabel(
+      (process.env.PROJECT_NAME_TAILSCALE || process.env.PROJECT_NAME || "dockerstacks3proxy").trim(),
+    ),
+  );
+  const tailnetDomain = trimLeadingTrailingDots(
+    normalizeHostLabel((process.env.TAILSCALE_TAILNET_DOMAIN || "").trim()),
+  );
+  if (!tailnetDomain) {
+    throw new Error("TAILSCALE_TAILNET_DOMAIN is required to build tailscale/serve.json");
+  }
+  const fqdn = [projectName, tailnetDomain].filter(Boolean).join(".");
+  const webHostKey = `${fqdn}:443`;
+  const templateWebEntry = Object.values(serveConfigTemplate.Web)[0];
+
+  const serveConfig = {
+    ...serveConfigTemplate,
+    Web: {
+      [webHostKey]: templateWebEntry,
+    },
+  };
+
+  const serveJsonPath = path.join(__dirname, "serve.json");
+  fs.mkdirSync(path.dirname(serveJsonPath), { recursive: true });
+  fs.writeFileSync(serveJsonPath, `${JSON.stringify(serveConfig, null, 2)}\n`, "utf-8");
+  console.log(`✅  serve-config: wrote ${serveJsonPath} (${webHostKey})`);
+}
+
 function pickDeviceId(device) {
   if (!device || typeof device !== "object") return "";
   return String(device.nodeId || device.id || device.deviceId || "").trim();
@@ -546,6 +597,8 @@ async function removeHostnameFromTailnet({ hostname, tailnet, clientSecret, clie
 }
 
 async function run() {
+  ensureServeConfigFileFromEnv();
+
   const mode = (process.argv[2] || "prepare").trim().toLowerCase();
   const keepIpEnabled = toBool(process.env.TAILSCALE_KEEP_IP_ENABLE, false);
   const removeHostnameEnabled = toBool(
