@@ -3,20 +3,14 @@
  * Admin UI + APIs for runtime status, cron management and S3 tests.
  */
 
-import { randomBytes } from 'crypto'
-import { Readable } from 'stream'
-import { readFileSync } from 'fs'
-import { dirname, join } from 'path'
-import { fileURLToPath } from 'url'
-import {
-  DeleteObjectCommand,
-  GetObjectCommand,
-  HeadBucketCommand,
-  ListObjectsV2Command,
-  PutObjectCommand,
-} from '@aws-sdk/client-s3'
+import { randomBytes } from "crypto";
+import { Readable } from "stream";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, ListObjectsV2Command, PutObjectCommand } from "@aws-sdk/client-s3";
 
-import config from '../config.js'
+import config from "../config.js";
 import {
   deleteAccount,
   getAccountById,
@@ -32,140 +26,259 @@ import {
   upsertBucketRecord,
   upsertRoute,
   upsertAccount,
-} from '../db.js'
-import { getAccountsStats, reloadAccountsFromRTDB, reloadAccountsFromSQLite, syncAccountsFromRows } from '../accountPool.js'
-import { rtdbBatchPatch } from '../firebase.js'
-import { buildRtdbAccountPath, suggestAccountId, validateAccountIdForRealtime } from '../accountId.js'
-import { getRtdbState } from './health.js'
-import {
-  getCronJobKinds,
-  listCronJobs,
-  removeCronJob,
-  runCronJobNow,
-  saveCronJob,
-} from '../cronScheduler.js'
-import { createS3Client } from '../inventoryScanner.js'
-import { resolveS3SigningRegion } from '../s3Signing.js'
-import {
-  isEmailOwner,
-  isSupabaseAccessToken,
-  normalizeSupabaseAccessTokenExp,
-  previewSupabaseS3,
-} from '../supabaseS3.js'
-import { buildRtdbRouteDocument, encodeKey, PUBLIC_PROXY_BUCKET } from '../metadata.js'
-import { buildDirectPublicObjectUrl } from '../publicObjectUrl.js'
-import { syncAccountsUsageBatch, syncRouteToRtdb } from '../controlPlane.js'
-import { refreshMetadataMetrics } from './metrics.js'
+} from "../db.js";
+import { getAccountsStats, reloadAccountsFromRTDB, reloadAccountsFromSQLite, syncAccountsFromRows } from "../accountPool.js";
+import { rtdbBatchPatch } from "../firebase.js";
+import { buildRtdbAccountPath, suggestAccountId, validateAccountIdForRealtime } from "../accountId.js";
+import { getRtdbState } from "./health.js";
+import { getCronJobKinds, listCronJobs, removeCronJob, runCronJobNow, saveCronJob } from "../cronScheduler.js";
+import { createS3Client } from "../inventoryScanner.js";
+import { resolveS3SigningRegion } from "../s3Signing.js";
+import { isEmailOwner, isSupabaseAccessToken, normalizeSupabaseAccessTokenExp, previewSupabaseS3 } from "../supabaseS3.js";
+import { buildRtdbRouteDocument, encodeKey, PUBLIC_PROXY_BUCKET } from "../metadata.js";
+import { buildDirectPublicObjectUrl } from "../publicObjectUrl.js";
+import { syncAccountsUsageBatch, syncRouteToRtdb } from "../controlPlane.js";
+import { refreshMetadataMetrics } from "./metrics.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const adminHtml = readFileSync(join(__dirname, '..', 'admin-ui.html'), 'utf-8')
-const adminIcon = readFileSync(join(__dirname, '..', 'admin-icon.svg'), 'utf-8')
-const DEFAULT_ADMIN_QUOTA_BYTES = 1024 * 1024 * 1024
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const adminHtml = readFileSync(join(__dirname, "..", "admin-ui.html"), "utf-8");
+const adminIcon = readFileSync(join(__dirname, "..", "admin-icon.svg"), "utf-8");
+const DEFAULT_ADMIN_QUOTA_BYTES = 1024 * 1024 * 1024;
 
-const RUNNER_INFO_PREFIX = '_DOTENVRTDB_RUNNER_'
-const DOCKER_ACCESS_URL_PREFIX = '_DOCKER_ACCESS_URL_'
+const RUNNER_INFO_PREFIX = "_DOTENVRTDB_RUNNER_";
+const DOCKER_ACCESS_URL_PREFIX = "_DOCKER_ACCESS_URL_";
+const CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX = "CLOUDFLARED_TUNNEL_HOSTNAME_";
 
 function collectEnvPrefix(prefix) {
-  const result = {}
+  const result = {};
   Object.entries(process.env).forEach(([key, value]) => {
-    if (!key.startsWith(prefix)) return
-    const normalized = normalizeString(value)
-    if (!normalized) return
-    result[key] = normalized
-  })
-  return result
+    if (!key.startsWith(prefix)) return;
+    const normalized = normalizeString(value);
+    if (!normalized) return;
+    result[key] = normalized;
+  });
+  return result;
+}
+
+function resolveEnvTemplate(value, depth = 0) {
+  const normalized = normalizeString(value);
+  if (!normalized) return "";
+  if (depth > 10) return normalized;
+
+  return normalized.replace(/\$\{([^}]+)\}/g, (match, variableName) => {
+    const envKey = normalizeString(variableName);
+    if (!envKey) return "";
+
+    const replacement = normalizeString(process.env[envKey]);
+    if (!replacement) return "";
+    if (replacement === match) return replacement;
+    return resolveEnvTemplate(replacement, depth + 1);
+  });
+}
+
+function readResolvedEnv(name) {
+  return resolveEnvTemplate(process.env[name]);
+}
+
+function collectResolvedEnvPrefix(prefix) {
+  const result = {};
+  Object.entries(process.env).forEach(([key, value]) => {
+    if (!key.startsWith(prefix)) return;
+    const normalized = resolveEnvTemplate(value);
+    if (!normalized) return;
+    result[key] = normalized;
+  });
+  return result;
 }
 
 function normalizeAccessSlug(value) {
   return normalizeString(value)
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function titleCaseFromKey(value) {
-  const raw = normalizeString(value)
-  if (!raw) return 'Unknown'
+  const raw = normalizeString(value);
+  if (!raw) return "Unknown";
   return raw
     .split(/[_\-.]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-    .join(' ')
+    .join(" ");
 }
 
 function pushAccessEntry(list, entry) {
-  if (!entry?.url) return
-  const url = normalizeString(entry.url)
-  if (!url) return
-  const key = `${normalizeAccessSlug(entry.app || entry.label || 'app')}::${normalizeAccessSlug(entry.via || 'direct')}::${url}`
-  if (list.some((item) => item.__dedupeKey === key)) return
-  list.push({ ...entry, url, __dedupeKey: key })
+  if (!entry?.url) return;
+  const url = normalizeString(entry.url);
+  if (!url) return;
+  const key = `${normalizeAccessSlug(entry.app || entry.label || "app")}::${normalizeAccessSlug(entry.via || "direct")}::${url}`;
+  if (list.some((item) => item.__dedupeKey === key)) return;
+  list.push({ ...entry, url, __dedupeKey: key });
 }
 
-function deriveDockerAccessEntriesFromEnv() {
-  const entries = []
-  const projectName = normalizeString(process.env.PROJECT_NAME) || 'myapp'
-  const domain = normalizeString(process.env.DOMAIN)
-  const tailnetDomain = normalizeString(process.env.TAILSCALE_TAILNET_DOMAIN)
-  const enableDozzle = normalizeBoolean(process.env.ENABLE_DOZZLE, true)
-  const enableFilebrowser = normalizeBoolean(process.env.ENABLE_FILEBROWSER, true)
-  const enableWebssh = normalizeBoolean(process.env.ENABLE_WEBSSH, true)
-  const appHost = projectName && domain ? `${projectName}.${domain}` : ''
-  const tailnetHost = projectName && tailnetDomain ? `${projectName}.${tailnetDomain}` : ''
-  const dozzlePort = normalizeString(process.env.DOZZLE_HOST_PORT) || '18080'
-  const filebrowserPort = normalizeString(process.env.FILEBROWSER_HOST_PORT) || '18081'
-  const websshPort = normalizeString(process.env.WEBSSH_HOST_PORT) || '17681'
+function ensureAccessUrl(value, defaultProtocol = "https") {
+  const normalized = normalizeString(value);
+  if (!normalized) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) return normalized;
+  return `${defaultProtocol}://${normalized}`;
+}
 
-  if (appHost) {
-    pushAccessEntry(entries, { app: 'S3Proxy', label: 'Main app', via: 'domain', url: `https://${appHost}`, source: 'inferred', hint: 'Main app qua domain chính.' })
-    pushAccessEntry(entries, { app: 'S3Proxy', label: 'Admin UI', via: 'domain', url: `https://${appHost}/admin`, source: 'inferred', hint: 'Admin UI của S3Proxy.' })
-  }
+function buildDockerAccessItem({ key, label, url, envKey, source = "env", hint = "" }) {
+  const normalizedUrl = normalizeString(url);
+  return {
+    key,
+    label,
+    url: normalizedUrl,
+    envKey,
+    source,
+    hint,
+    available: Boolean(normalizedUrl),
+  };
+}
 
-  if (tailnetHost) {
-    pushAccessEntry(entries, { app: 'S3Proxy', label: 'Main app', via: 'tailscale-domain', url: `https://${tailnetHost}`, source: 'inferred', hint: 'Main app qua Tailscale Serve / internal TLS.' })
-    pushAccessEntry(entries, { app: 'S3Proxy', label: 'Admin UI', via: 'tailscale-domain', url: `https://${tailnetHost}/admin`, source: 'inferred', hint: 'Admin UI qua Tailscale domain.' })
-  }
+function flattenDockerAccessGroups(groups) {
+  const entries = [];
+  groups.forEach((group) => {
+    group?.items?.forEach((item) => {
+      if (!item?.available || !item.url) return;
+      pushAccessEntry(entries, {
+        app: group.title || group.id || "Access",
+        label: item.label || item.key || "Link",
+        via: item.key || group.id || "direct",
+        url: item.url,
+        source: item.source || "env",
+        envKey: item.envKey,
+        hint: item.hint,
+      });
+    });
+  });
+  return entries.map(({ __dedupeKey, ...item }) => item);
+}
 
-  if (domain && enableDozzle) {
-    pushAccessEntry(entries, { app: 'Dozzle', label: 'Logs', via: 'domain', url: `https://logs.${projectName}.${domain}`, source: 'inferred', hint: 'Log viewer qua Caddy/domain.' })
-    pushAccessEntry(entries, { app: 'Dozzle', label: 'Logs alias', via: 'domain-alias', url: `https://logs.${domain}`, source: 'inferred', hint: 'Alias logs theo compose.ops.yml.' })
-  }
-  if (tailnetHost && enableDozzle) {
-    pushAccessEntry(entries, { app: 'Dozzle', label: 'Logs', via: 'tailscale-port', url: `http://${tailnetHost}:${dozzlePort}`, source: 'inferred', hint: 'Tailnet access qua host port Dozzle.' })
-  }
+function deriveDockerAccessFromEnv() {
+  const projectName = readResolvedEnv("PROJECT_NAME") || "myapp";
+  const domain = readResolvedEnv("DOMAIN");
+  const tailnetDomain = readResolvedEnv("TAILSCALE_TAILNET_DOMAIN");
+  const dozzlePort = readResolvedEnv("DOZZLE_HOST_PORT") || "18080";
+  const filebrowserPort = readResolvedEnv("FILEBROWSER_HOST_PORT") || "18081";
+  const websshPort = readResolvedEnv("WEBSSH_HOST_PORT") || "17681";
+  const cloudflaredHostnames = collectResolvedEnvPrefix(CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX);
+  const customEnv = collectResolvedEnvPrefix(DOCKER_ACCESS_URL_PREFIX);
+  const tailscaleHost = projectName && tailnetDomain ? `${projectName}.${tailnetDomain}` : tailnetDomain;
 
-  if (domain && enableFilebrowser) {
-    pushAccessEntry(entries, { app: 'Filebrowser', label: 'Files', via: 'domain', url: `https://files.${projectName}.${domain}`, source: 'inferred', hint: 'Filebrowser qua Caddy/domain.' })
-    pushAccessEntry(entries, { app: 'Filebrowser', label: 'Files alias', via: 'domain-alias', url: `https://files.${domain}`, source: 'inferred', hint: 'Alias files theo compose.ops.yml.' })
-  }
-  if (tailnetHost && enableFilebrowser) {
-    pushAccessEntry(entries, { app: 'Filebrowser', label: 'Files', via: 'tailscale-port', url: `http://${tailnetHost}:${filebrowserPort}`, source: 'inferred', hint: 'Tailnet access qua host port Filebrowser.' })
-  }
+  const cloudflaredItems = [
+    { key: "root", label: "Root", envKey: `${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}1` },
+    { key: "main", label: "Main", envKey: `${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}2` },
+    { key: "ttyd", label: "TTYD", envKey: `${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}3` },
+    { key: "dozzle", label: "Dozzle", envKey: `${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}4` },
+    { key: "files", label: "Files", envKey: `${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}5` },
+  ].map((item) =>
+    buildDockerAccessItem({
+      ...item,
+      url: ensureAccessUrl(cloudflaredHostnames[item.envKey]),
+      hint: cloudflaredHostnames[item.envKey]
+        ? `Lấy từ ${item.envKey}.`
+        : `Chưa cấu hình ${item.envKey}.`,
+    }),
+  );
 
-  if (domain && enableWebssh) {
-    pushAccessEntry(entries, { app: 'WebSSH', label: 'TTYD', via: 'domain', url: `https://ttyd.${projectName}.${domain}`, source: 'inferred', hint: 'Web terminal qua Caddy/domain.' })
-    pushAccessEntry(entries, { app: 'WebSSH', label: 'TTYD alias', via: 'domain-alias', url: `https://ttyd.${domain}`, source: 'inferred', hint: 'Alias ttyd theo compose.ops.yml.' })
-  }
-  if (tailnetHost && enableWebssh) {
-    pushAccessEntry(entries, { app: 'WebSSH', label: 'TTYD', via: 'tailscale-port', url: `http://${tailnetHost}:${websshPort}`, source: 'inferred', hint: 'Tailnet access qua host port WebSSH.' })
-  }
+  const tailscaleItems = [
+    buildDockerAccessItem({
+      key: "root",
+      label: "Root",
+      envKey: "TAILSCALE_TAILNET_DOMAIN",
+      url: tailscaleHost ? `https://${tailscaleHost}` : "",
+      hint: tailscaleHost
+        ? "Root app qua Tailscale Serve."
+        : "Chưa đủ PROJECT_NAME / TAILSCALE_TAILNET_DOMAIN để dựng root URL.",
+    }),
+    buildDockerAccessItem({
+      key: "ttyd",
+      label: "TTYD",
+      envKey: "WEBSSH_HOST_PORT",
+      url: tailscaleHost ? `http://${tailscaleHost}:${websshPort}` : "",
+      hint: tailscaleHost
+        ? `Đi qua port ${websshPort}.`
+        : "Thiếu tailnet host để dựng URL ttyd.",
+    }),
+    buildDockerAccessItem({
+      key: "dozzle",
+      label: "Dozzle",
+      envKey: "DOZZLE_HOST_PORT",
+      url: tailscaleHost ? `http://${tailscaleHost}:${dozzlePort}` : "",
+      hint: tailscaleHost
+        ? `Đi qua port ${dozzlePort}.`
+        : "Thiếu tailnet host để dựng URL dozzle.",
+    }),
+    buildDockerAccessItem({
+      key: "files",
+      label: "Files",
+      envKey: "FILEBROWSER_HOST_PORT",
+      url: tailscaleHost ? `http://${tailscaleHost}:${filebrowserPort}` : "",
+      hint: tailscaleHost
+        ? `Đi qua port ${filebrowserPort}.`
+        : "Thiếu tailnet host để dựng URL files.",
+    }),
+  ];
 
-  const customUrls = collectEnvPrefix(DOCKER_ACCESS_URL_PREFIX)
-  Object.entries(customUrls).forEach(([key, value]) => {
-    const rawName = key.slice(DOCKER_ACCESS_URL_PREFIX.length) || 'CUSTOM'
-    const humanName = titleCaseFromKey(rawName)
-    const parts = rawName.split('__').filter(Boolean)
-    const app = parts[0] ? titleCaseFromKey(parts[0]) : humanName
-    const via = parts[1] ? normalizeAccessSlug(parts[1]) || 'custom-env' : 'custom-env'
-    const label = parts.length > 2 ? titleCaseFromKey(parts.slice(2).join('_')) : humanName
-    pushAccessEntry(entries, { app, label, via, url: value, source: 'env', envKey: key, hint: 'Custom URL lấy trực tiếp từ biến môi trường.' })
-  })
+  const customItems = Object.entries(customEnv)
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+    .map(([key, value]) => {
+      const rawName = key.slice(DOCKER_ACCESS_URL_PREFIX.length) || "CUSTOM";
+      const humanName = titleCaseFromKey(rawName);
+      const parts = rawName.split("__").filter(Boolean);
+      const label = parts.length > 0 ? parts.map((part) => titleCaseFromKey(part)).join(" / ") : humanName;
 
-  return entries.map(({ __dedupeKey, ...item }) => item)
+      return buildDockerAccessItem({
+        key: normalizeAccessSlug(rawName) || "custom",
+        label,
+        url: ensureAccessUrl(value),
+        envKey: key,
+        hint: "Custom URL lấy trực tiếp từ biến môi trường.",
+      });
+    });
+
+  const groups = [
+    {
+      id: "cloudflared",
+      title: "Cloudflared",
+      description: `Đọc trực tiếp từ ${CLOUDFLARED_TUNNEL_HOSTNAME_PREFIX}<index> cho các slot root, main, ttyd, dozzle, files.`,
+      items: cloudflaredItems,
+    },
+    {
+      id: "tailscale",
+      title: "Tailscale",
+      description: "Root dùng Tailscale Serve, các app ttyd / dozzle / files đi theo host port hiện tại.",
+      items: tailscaleItems,
+    },
+    {
+      id: "custom",
+      title: "Custom URL",
+      description: `Hiển thị toàn bộ key có prefix ${DOCKER_ACCESS_URL_PREFIX}, kể cả khi chưa có key nào.`,
+      items: customItems,
+    },
+  ];
+
+  return {
+    groups,
+    urls: flattenDockerAccessGroups(groups),
+    customEnv,
+    context: {
+      projectName,
+      domain,
+      tailscaleTailnetDomain: tailnetDomain,
+      tailscaleHost,
+      dozzleHostPort: dozzlePort,
+      filebrowserHostPort: filebrowserPort,
+      websshHostPort: websshPort,
+      cloudflaredHostnames,
+    },
+  };
 }
 
 const adminServiceWorker = `
-const CACHE_NAME = 's3proxy-admin-v1'
+const CACHE_NAME = 's3proxy-admin-v2'
 const ADMIN_SHELL = ['/admin', '/admin/manifest.webmanifest', '/admin/icon.svg']
 
 self.addEventListener('install', (event) => {
@@ -199,11 +312,11 @@ self.addEventListener('fetch', (event) => {
       .catch(() => caches.match(request).then((cached) => cached || caches.match('/admin'))),
   )
 })
-`.trim()
+`.trim();
 
 function formatPercent(used, quota) {
-  if (!quota) return 0
-  return Number(((used / quota) * 100).toFixed(2))
+  if (!quota) return 0;
+  return Number(((used / quota) * 100).toFixed(2));
 }
 
 function toPublicAccount(row) {
@@ -214,9 +327,9 @@ function toPublicAccount(row) {
     region: row.region,
     bucket: row.bucket,
     publicBucket: row.public_bucket === 1 || row.public_bucket === true,
-    addressingStyle: row.addressing_style ?? 'path',
-    payloadSigningMode: row.payload_signing_mode ?? 'unsigned',
-    emailOwner: row.email_owner ?? '',
+    addressingStyle: row.addressing_style ?? "path",
+    payloadSigningMode: row.payload_signing_mode ?? "unsigned",
+    emailOwner: row.email_owner ?? "",
     supabaseAccessTokenExp: row.supabase_access_token_exp ?? null,
     supabaseAccessTokenExperimental: row.supabase_access_token_exp ?? null,
     hasSupabaseAccessToken: Boolean(row.supabase_access_token),
@@ -226,85 +339,85 @@ function toPublicAccount(row) {
     usedPercent: formatPercent(row.used_bytes ?? 0, row.quota_bytes ?? 0),
     addedAt: row.added_at ?? null,
     hasSecret: Boolean(row.secret_key),
-  }
+  };
 }
 
 function normalizeString(value) {
-  if (value === undefined || value === null) return ''
-  return String(value).trim()
+  if (value === undefined || value === null) return "";
+  return String(value).trim();
 }
 
 function normalizeBoolean(value, fallback = true) {
-  if (value === undefined || value === null || value === '') return fallback
-  if (typeof value === 'boolean') return value
-  if (typeof value === 'number') return value !== 0
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
 
-  const normalized = String(value).trim().toLowerCase()
-  if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true
-  if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false
-  return fallback
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function normalizeAddressingStyle(value) {
-  const raw = normalizeString(value).toLowerCase()
-  if (!raw) return 'path'
-  if (['path', 'path-style', 'path_style'].includes(raw)) return 'path'
-  if (['virtual', 'virtual-hosted', 'virtual_hosted', 'virtual-hosted-style'].includes(raw)) return 'virtual'
-  return ''
+  const raw = normalizeString(value).toLowerCase();
+  if (!raw) return "path";
+  if (["path", "path-style", "path_style"].includes(raw)) return "path";
+  if (["virtual", "virtual-hosted", "virtual_hosted", "virtual-hosted-style"].includes(raw)) return "virtual";
+  return "";
 }
 
 function normalizePayloadSigningMode(value) {
-  const raw = normalizeString(value).toLowerCase()
-  if (!raw) return 'unsigned'
-  if (['unsigned', 'unsigned-payload', 'unsigned_payload'].includes(raw)) return 'unsigned'
-  if (['signed', 'strict', 'required'].includes(raw)) return 'signed'
-  return ''
+  const raw = normalizeString(value).toLowerCase();
+  if (!raw) return "unsigned";
+  if (["unsigned", "unsigned-payload", "unsigned_payload"].includes(raw)) return "unsigned";
+  if (["signed", "strict", "required"].includes(raw)) return "signed";
+  return "";
 }
 
 function readAccountField(payload, existing, aliases = []) {
   for (const alias of aliases) {
-    if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, alias)) {
-      return payload[alias]
+    if (payload && typeof payload === "object" && Object.prototype.hasOwnProperty.call(payload, alias)) {
+      return payload[alias];
     }
-    const parts = String(alias).split('.')
-    let current = payload
-    let found = true
+    const parts = String(alias).split(".");
+    let current = payload;
+    let found = true;
     for (const part of parts) {
-      if (!current || typeof current !== 'object' || !(part in current)) {
-        found = false
-        break
+      if (!current || typeof current !== "object" || !(part in current)) {
+        found = false;
+        break;
       }
-      current = current[part]
+      current = current[part];
     }
-    if (found && current !== undefined) return current
+    if (found && current !== undefined) return current;
   }
 
-  return existing
+  return existing;
 }
 
 function normalizePositiveInteger(value, fallback, fieldName, errors) {
-  if (value === undefined || value === null || value === '') return fallback
-  const numeric = Number(value)
+  if (value === undefined || value === null || value === "") return fallback;
+  const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) {
-    errors.push(`${fieldName} must be a positive number`)
-    return fallback
+    errors.push(`${fieldName} must be a positive number`);
+    return fallback;
   }
-  return Math.trunc(numeric)
+  return Math.trunc(numeric);
 }
 
 function normalizeNonNegativeInteger(value, fallback, fieldName, errors) {
-  if (value === undefined || value === null || value === '') return fallback
-  const numeric = Number(value)
+  if (value === undefined || value === null || value === "") return fallback;
+  const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric < 0) {
-    errors.push(`${fieldName} must be a non-negative number`)
-    return fallback
+    errors.push(`${fieldName} must be a non-negative number`);
+    return fallback;
   }
-  return Math.trunc(numeric)
+  return Math.trunc(numeric);
 }
 
 function summarizeS3Error(err) {
-  const metadata = err?.$metadata ?? {}
-  const statusCode = Number(metadata.httpStatusCode)
+  const metadata = err?.$metadata ?? {};
+  const statusCode = Number(metadata.httpStatusCode);
 
   return {
     name: normalizeString(err?.name) || null,
@@ -314,74 +427,73 @@ function summarizeS3Error(err) {
     requestId: normalizeString(metadata.requestId) || null,
     extendedRequestId: normalizeString(metadata.extendedRequestId) || null,
     cfId: normalizeString(metadata.cfId) || null,
-  }
+  };
 }
 
 function formatS3ErrorSummary(summary) {
-  if (!summary) return 'Unknown S3 error'
+  if (!summary) return "Unknown S3 error";
 
-  const parts = []
-  if (summary.name) parts.push(summary.name)
-  if (summary.code && summary.code !== summary.name) parts.push(`code=${summary.code}`)
-  if (summary.httpStatusCode) parts.push(`status=${summary.httpStatusCode}`)
-  if (summary.message) parts.push(summary.message)
+  const parts = [];
+  if (summary.name) parts.push(summary.name);
+  if (summary.code && summary.code !== summary.name) parts.push(`code=${summary.code}`);
+  if (summary.httpStatusCode) parts.push(`status=${summary.httpStatusCode}`);
+  if (summary.message) parts.push(summary.message);
 
-  return parts.length > 0 ? parts.join(' | ') : 'Unknown S3 error'
+  return parts.length > 0 ? parts.join(" | ") : "Unknown S3 error";
 }
 
 function isMissingBucketSummary(summary) {
-  if (!summary) return false
-  if (summary.httpStatusCode === 404) return true
+  if (!summary) return false;
+  if (summary.httpStatusCode === 404) return true;
 
-  const combined = `${summary.name ?? ''} ${summary.code ?? ''} ${summary.message ?? ''}`.toLowerCase()
-  return combined.includes('nosuchbucket')
-    || combined.includes('notfound')
-    || combined.includes('bucket not found')
+  const combined = `${summary.name ?? ""} ${summary.code ?? ""} ${summary.message ?? ""}`.toLowerCase();
+  return combined.includes("nosuchbucket") || combined.includes("notfound") || combined.includes("bucket not found");
 }
 
 function isLikelyExistingBucketSummary(summary) {
-  if (!summary) return false
-  if ([301, 307].includes(summary.httpStatusCode)) return true
+  if (!summary) return false;
+  if ([301, 307].includes(summary.httpStatusCode)) return true;
 
-  const combined = `${summary.name ?? ''} ${summary.code ?? ''} ${summary.message ?? ''}`.toLowerCase()
-  return combined.includes('permanentredirect')
-    || combined.includes('authorization headermalformed')
+  const combined = `${summary.name ?? ""} ${summary.code ?? ""} ${summary.message ?? ""}`.toLowerCase();
+  return combined.includes("permanentredirect") || combined.includes("authorization headermalformed");
 }
 
 function toSafeAccountLog(row) {
   return {
     accountId: row.account_id,
-    accessKeyIdSuffix: row.access_key_id ? row.access_key_id.slice(-6) : '',
+    accessKeyIdSuffix: row.access_key_id ? row.access_key_id.slice(-6) : "",
     hasSecretKey: Boolean(row.secret_key),
     endpoint: row.endpoint,
     region: row.region,
     bucket: row.bucket,
     publicBucket: row.public_bucket === 1 || row.public_bucket === true,
-    addressingStyle: row.addressing_style ?? 'path',
-    payloadSigningMode: row.payload_signing_mode ?? 'unsigned',
-    emailOwner: row.email_owner ?? '',
+    addressingStyle: row.addressing_style ?? "path",
+    payloadSigningMode: row.payload_signing_mode ?? "unsigned",
+    emailOwner: row.email_owner ?? "",
     hasSupabaseAccessToken: Boolean(row.supabase_access_token),
     hasSupabaseAccessTokenExp: Boolean(row.supabase_access_token_exp),
     quotaBytes: row.quota_bytes,
     usedBytes: row.used_bytes,
     active: row.active === 1 || row.active === true,
-  }
+  };
 }
 
 function toIncomingAccountLog(payload) {
-  const accessTokenExp = normalizeSupabaseAccessTokenExp(readAccountField(payload, null, [
-    'supabaseAccessTokenExp',
-    'supabaseAccessTokenExperimental',
-    'supabase_access_token_exp',
-    'supabase_access_token_experimental',
-    'supabase.accessTokenExp',
-    'supabase.accessTokenExperimental',
-    'supabase.access_token_exp',
-    'supabase.accessToken.exp',
-    'supabase.accessToken.experimental',
-    'supabase.access_token.experimental',
-    'supabase.access_token.exp',
-  ]))
+  const accessTokenExp = normalizeSupabaseAccessTokenExp(
+    readAccountField(payload, null, [
+      "supabaseAccessTokenExp",
+      "supabaseAccessTokenExperimental",
+      "supabase_access_token_exp",
+      "supabase_access_token_experimental",
+      "supabase.accessTokenExp",
+      "supabase.accessTokenExperimental",
+      "supabase.access_token_exp",
+      "supabase.accessToken.exp",
+      "supabase.accessToken.experimental",
+      "supabase.access_token.experimental",
+      "supabase.access_token.exp",
+    ]),
+  );
 
   return {
     requestedAccountId: normalizeString(payload.accountId ?? payload.account_id),
@@ -391,16 +503,20 @@ function toIncomingAccountLog(payload) {
     publicBucket: normalizeBoolean(payload.publicBucket ?? payload.public_bucket, false),
     hasAccessKeyId: Boolean(normalizeString(payload.accessKeyId ?? payload.access_key_id)),
     hasSecretAccessKey: Boolean(normalizeString(payload.secretAccessKey ?? payload.secret_key)),
-    hasEmailOwner: Boolean(normalizeString(readAccountField(payload, '', ['emailOwner', 'email_owner', 'supabase.emailOwner']))),
-    hasSupabaseAccessToken: Boolean(normalizeString(readAccountField(payload, '', [
-      'supabaseAccessToken',
-      'supabase_access_token',
-      'supabase.accessToken',
-      'supabase.access_token',
-      'supabase.accessToken.value',
-    ]))),
+    hasEmailOwner: Boolean(normalizeString(readAccountField(payload, "", ["emailOwner", "email_owner", "supabase.emailOwner"]))),
+    hasSupabaseAccessToken: Boolean(
+      normalizeString(
+        readAccountField(payload, "", [
+          "supabaseAccessToken",
+          "supabase_access_token",
+          "supabase.accessToken",
+          "supabase.access_token",
+          "supabase.accessToken.value",
+        ]),
+      ),
+    ),
     hasSupabaseAccessTokenExp: Boolean(accessTokenExp),
-  }
+  };
 }
 
 function toRtdbAccountDocument(account) {
@@ -411,14 +527,14 @@ function toRtdbAccountDocument(account) {
     endpoint: account.endpoint,
     region: account.region,
     bucket: account.bucket,
-    addressingStyle: account.addressing_style ?? 'path',
-    payloadSigningMode: account.payload_signing_mode ?? 'unsigned',
-    emailOwner: account.email_owner ?? '',
-    supabaseAccessToken: account.supabase_access_token ?? '',
+    addressingStyle: account.addressing_style ?? "path",
+    payloadSigningMode: account.payload_signing_mode ?? "unsigned",
+    emailOwner: account.email_owner ?? "",
+    supabaseAccessToken: account.supabase_access_token ?? "",
     supabaseAccessTokenExp: account.supabase_access_token_exp ?? null,
     supabaseAccessTokenExperimental: account.supabase_access_token_exp ?? null,
     supabase: {
-      accessToken: account.supabase_access_token ?? '',
+      accessToken: account.supabase_access_token ?? "",
       accessTokenExp: account.supabase_access_token_exp ?? null,
       accessTokenExperimental: account.supabase_access_token_exp ?? null,
     },
@@ -427,7 +543,7 @@ function toRtdbAccountDocument(account) {
     usedBytes: account.used_bytes,
     active: account.active === 1,
     addedAt: account.added_at,
-  }
+  };
 }
 
 function toPrivateExportAccount(account) {
@@ -439,16 +555,16 @@ function toPrivateExportAccount(account) {
     region: account.region,
     bucket: account.bucket,
     public_bucket: account.public_bucket === 1 || account.public_bucket === true ? 1 : 0,
-    addressing_style: account.addressing_style ?? 'path',
-    payload_signing_mode: account.payload_signing_mode ?? 'unsigned',
-    email_owner: account.email_owner ?? '',
-    supabase_access_token: account.supabase_access_token ?? '',
+    addressing_style: account.addressing_style ?? "path",
+    payload_signing_mode: account.payload_signing_mode ?? "unsigned",
+    email_owner: account.email_owner ?? "",
+    supabase_access_token: account.supabase_access_token ?? "",
     supabase_access_token_exp: account.supabase_access_token_exp ?? null,
     quota_bytes: account.quota_bytes ?? 0,
     used_bytes: account.used_bytes ?? 0,
     active: account.active === 1 || account.active === true ? 1 : 0,
     added_at: account.added_at ?? Date.now(),
-  }
+  };
 }
 
 function toRuntimeExportRoute(route) {
@@ -456,119 +572,108 @@ function toRuntimeExportRoute(route) {
     ...route,
     route_scope: route.route_scope ?? ROUTE_SCOPE.MAIN,
     public_url: route.public_url ?? null,
-  }
+  };
 }
 
 function normalizeAccountPayload(payload, existing = null) {
-  const errors = []
+  const errors = [];
 
-  const accountIdInput = normalizeString(payload.accountId ?? payload.account_id ?? existing?.account_id)
-  const accountIdValidation = validateAccountIdForRealtime(accountIdInput)
+  const accountIdInput = normalizeString(payload.accountId ?? payload.account_id ?? existing?.account_id);
+  const accountIdValidation = validateAccountIdForRealtime(accountIdInput);
   if (!accountIdValidation.valid) {
-    let message = `accountId ${accountIdValidation.reason}`
-    const suggestion = suggestAccountId(accountIdInput)
+    let message = `accountId ${accountIdValidation.reason}`;
+    const suggestion = suggestAccountId(accountIdInput);
     if (suggestion && suggestion !== accountIdValidation.accountId) {
-      message += ` (suggested: ${suggestion})`
+      message += ` (suggested: ${suggestion})`;
     }
-    errors.push(message)
+    errors.push(message);
   }
 
-  const accessKeyId = normalizeString(payload.accessKeyId ?? payload.access_key_id ?? existing?.access_key_id)
-  const secretKey = normalizeString(payload.secretAccessKey ?? payload.secret_key) || existing?.secret_key || ''
-  const endpoint = normalizeString(payload.endpoint ?? existing?.endpoint)
-  const region = normalizeString(payload.region ?? existing?.region)
-  const bucket = normalizeString(payload.bucket ?? existing?.bucket)
-  const addressingStyle = normalizeAddressingStyle(payload.addressingStyle ?? payload.addressing_style ?? existing?.addressing_style)
+  const accessKeyId = normalizeString(payload.accessKeyId ?? payload.access_key_id ?? existing?.access_key_id);
+  const secretKey = normalizeString(payload.secretAccessKey ?? payload.secret_key) || existing?.secret_key || "";
+  const endpoint = normalizeString(payload.endpoint ?? existing?.endpoint);
+  const region = normalizeString(payload.region ?? existing?.region);
+  const bucket = normalizeString(payload.bucket ?? existing?.bucket);
+  const addressingStyle = normalizeAddressingStyle(payload.addressingStyle ?? payload.addressing_style ?? existing?.addressing_style);
   const payloadSigningMode = normalizePayloadSigningMode(
     payload.payloadSigningMode ?? payload.payload_signing_mode ?? existing?.payload_signing_mode,
-  )
+  );
   const emailOwnerRaw = readAccountField(payload, existing?.email_owner, [
-    'emailOwner',
-    'email_owner',
-    'supabase.emailOwner',
-    'supabase.email_owner',
-  ])
-  const emailOwner = normalizeString(emailOwnerRaw).toLowerCase()
+    "emailOwner",
+    "email_owner",
+    "supabase.emailOwner",
+    "supabase.email_owner",
+  ]);
+  const emailOwner = normalizeString(emailOwnerRaw).toLowerCase();
   const supabaseAccessTokenRaw = readAccountField(payload, existing?.supabase_access_token, [
-    'supabaseAccessToken',
-    'supabase_access_token',
-    'supabase.accessToken',
-    'supabase.access_token',
-    'supabase.accessToken.value',
-  ])
-  const supabaseAccessToken = normalizeString(supabaseAccessTokenRaw) || existing?.supabase_access_token || ''
-  const supabaseAccessTokenExpInput = readAccountField(
-    payload,
-    existing?.supabase_access_token_exp,
-    [
-      'supabaseAccessTokenExp',
-      'supabaseAccessTokenExperimental',
-      'supabase_access_token_exp',
-      'supabase_access_token_experimental',
-      'supabase.accessTokenExp',
-      'supabase.accessTokenExperimental',
-      'supabase.access_token_exp',
-      'supabase.accessToken.exp',
-      'supabase.accessToken.experimental',
-      'supabase.access_token.experimental',
-      'supabase.access_token.exp',
-    ],
-  )
-  const supabaseAccessTokenExp = supabaseAccessTokenExpInput === ''
-    ? normalizeSupabaseAccessTokenExp(existing?.supabase_access_token_exp)
-    : normalizeSupabaseAccessTokenExp(supabaseAccessTokenExpInput)
+    "supabaseAccessToken",
+    "supabase_access_token",
+    "supabase.accessToken",
+    "supabase.access_token",
+    "supabase.accessToken.value",
+  ]);
+  const supabaseAccessToken = normalizeString(supabaseAccessTokenRaw) || existing?.supabase_access_token || "";
+  const supabaseAccessTokenExpInput = readAccountField(payload, existing?.supabase_access_token_exp, [
+    "supabaseAccessTokenExp",
+    "supabaseAccessTokenExperimental",
+    "supabase_access_token_exp",
+    "supabase_access_token_experimental",
+    "supabase.accessTokenExp",
+    "supabase.accessTokenExperimental",
+    "supabase.access_token_exp",
+    "supabase.accessToken.exp",
+    "supabase.accessToken.experimental",
+    "supabase.access_token.experimental",
+    "supabase.access_token.exp",
+  ]);
+  const supabaseAccessTokenExp =
+    supabaseAccessTokenExpInput === ""
+      ? normalizeSupabaseAccessTokenExp(existing?.supabase_access_token_exp)
+      : normalizeSupabaseAccessTokenExp(supabaseAccessTokenExpInput);
   const quotaBytes = normalizePositiveInteger(
     payload.quotaBytes ?? payload.quota_bytes,
     existing?.quota_bytes ?? DEFAULT_ADMIN_QUOTA_BYTES,
-    'quotaBytes',
+    "quotaBytes",
     errors,
-  )
+  );
   const publicBucket = normalizeBoolean(
     payload.publicBucket ?? payload.public_bucket,
-    existing ? (existing.public_bucket === 1 || existing.public_bucket === true) : false,
-  ) ? 1 : 0
-  const usedBytes = normalizeNonNegativeInteger(
-    payload.usedBytes ?? payload.used_bytes,
-    existing?.used_bytes ?? 0,
-    'usedBytes',
-    errors,
+    existing ? existing.public_bucket === 1 || existing.public_bucket === true : false,
   )
-  const addedAt = normalizeNonNegativeInteger(
-    payload.addedAt ?? payload.added_at,
-    existing?.added_at ?? Date.now(),
-    'addedAt',
-    errors,
-  )
-  const active = normalizeBoolean(payload.active, existing ? (existing.active === 1 || existing.active === true) : true) ? 1 : 0
+    ? 1
+    : 0;
+  const usedBytes = normalizeNonNegativeInteger(payload.usedBytes ?? payload.used_bytes, existing?.used_bytes ?? 0, "usedBytes", errors);
+  const addedAt = normalizeNonNegativeInteger(payload.addedAt ?? payload.added_at, existing?.added_at ?? Date.now(), "addedAt", errors);
+  const active = normalizeBoolean(payload.active, existing ? existing.active === 1 || existing.active === true : true) ? 1 : 0;
 
-  if (!accessKeyId) errors.push('accessKeyId is required')
-  if (!secretKey) errors.push('secretAccessKey is required')
-  if (!endpoint) errors.push('endpoint is required')
-  if (!region) errors.push('region is required')
-  if (!bucket) errors.push('bucket is required')
-  if (!addressingStyle) errors.push('addressingStyle must be one of: path, virtual')
-  if (!payloadSigningMode) errors.push('payloadSigningMode must be one of: unsigned, signed')
-  if (emailOwner && !isEmailOwner(emailOwner)) errors.push('emailOwner must be a valid email')
+  if (!accessKeyId) errors.push("accessKeyId is required");
+  if (!secretKey) errors.push("secretAccessKey is required");
+  if (!endpoint) errors.push("endpoint is required");
+  if (!region) errors.push("region is required");
+  if (!bucket) errors.push("bucket is required");
+  if (!addressingStyle) errors.push("addressingStyle must be one of: path, virtual");
+  if (!payloadSigningMode) errors.push("payloadSigningMode must be one of: unsigned, signed");
+  if (emailOwner && !isEmailOwner(emailOwner)) errors.push("emailOwner must be a valid email");
   if (supabaseAccessToken && !isSupabaseAccessToken(supabaseAccessToken)) {
-    errors.push('supabaseAccessToken must match token format sbp_...')
+    errors.push("supabaseAccessToken must match token format sbp_...");
   }
   if (supabaseAccessTokenExp && !isSupabaseAccessToken(supabaseAccessTokenExp)) {
-    errors.push('supabaseAccessTokenExp must match token format sbp_...')
+    errors.push("supabaseAccessTokenExp must match token format sbp_...");
   }
 
   if (endpoint) {
     try {
-      const parsed = new URL(endpoint)
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        errors.push('endpoint must use http or https')
+      const parsed = new URL(endpoint);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        errors.push("endpoint must use http or https");
       }
     } catch {
-      errors.push('endpoint must be a valid URL')
+      errors.push("endpoint must be a valid URL");
     }
   }
 
   if (errors.length > 0) {
-    return { errors, row: null, accountId: accountIdValidation.accountId || accountIdInput }
+    return { errors, row: null, accountId: accountIdValidation.accountId || accountIdInput };
   }
 
   return {
@@ -592,41 +697,44 @@ function normalizeAccountPayload(payload, existing = null) {
       active,
       added_at: addedAt,
     },
-  }
+  };
 }
 
 async function verifyBucketExists(accountRow, logger = null) {
-  const client = createS3Client(accountRow)
-  const attempts = []
+  const client = createS3Client(accountRow);
+  const attempts = [];
   const checks = [
-    { operation: 'HeadBucket', command: new HeadBucketCommand({ Bucket: accountRow.bucket }) },
-    { operation: 'ListObjectsV2', command: new ListObjectsV2Command({ Bucket: accountRow.bucket, MaxKeys: 1 }) },
-  ]
+    { operation: "HeadBucket", command: new HeadBucketCommand({ Bucket: accountRow.bucket }) },
+    { operation: "ListObjectsV2", command: new ListObjectsV2Command({ Bucket: accountRow.bucket, MaxKeys: 1 }) },
+  ];
 
   for (const check of checks) {
     try {
-      await client.send(check.command)
-      attempts.push({ operation: check.operation, ok: true })
+      await client.send(check.command);
+      attempts.push({ operation: check.operation, ok: true });
       return {
         exists: true,
         verifiedBy: check.operation,
         attempts,
         detail: `${check.operation} succeeded`,
-      }
+      };
     } catch (err) {
-      const error = summarizeS3Error(err)
+      const error = summarizeS3Error(err);
       attempts.push({
         operation: check.operation,
         ok: false,
         error,
-      })
+      });
 
-      logger?.warn({
-        accountId: accountRow.account_id,
-        bucket: accountRow.bucket,
-        operation: check.operation,
-        error,
-      }, 'admin account bucket verification step failed')
+      logger?.warn(
+        {
+          accountId: accountRow.account_id,
+          bucket: accountRow.bucket,
+          operation: check.operation,
+          error,
+        },
+        "admin account bucket verification step failed",
+      );
 
       if (isMissingBucketSummary(error)) {
         return {
@@ -634,72 +742,74 @@ async function verifyBucketExists(accountRow, logger = null) {
           verifiedBy: null,
           attempts,
           detail: formatS3ErrorSummary(error),
-        }
+        };
       }
 
       if (isLikelyExistingBucketSummary(error)) {
         return {
           exists: true,
-          verifiedBy: `${check.operation}:${error.name || error.code || error.httpStatusCode || 'redirect'}`,
+          verifiedBy: `${check.operation}:${error.name || error.code || error.httpStatusCode || "redirect"}`,
           attempts,
           detail: formatS3ErrorSummary(error),
-        }
+        };
       }
     }
   }
 
-  const lastError = attempts.at(-1)?.error ?? null
+  const lastError = attempts.at(-1)?.error ?? null;
   return {
     exists: null,
     verifiedBy: null,
     attempts,
     detail: formatS3ErrorSummary(lastError),
-  }
+  };
 }
 
 function readStreamBodyToString(body) {
-  if (!body) return Promise.resolve('')
-  if (typeof body.transformToString === 'function') {
-    return body.transformToString()
+  if (!body) return Promise.resolve("");
+  if (typeof body.transformToString === "function") {
+    return body.transformToString();
   }
 
   return new Promise((resolve, reject) => {
-    const chunks = []
-    body.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-    body.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
-    body.on('error', reject)
-  })
+    const chunks = [];
+    body.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    body.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    body.on("error", reject);
+  });
 }
 
 async function runS3Probe(account) {
-  const client = createS3Client(account)
-  const probeKey = `${config.ADMIN_TEST_PREFIX}/${account.account_id}-${Date.now()}-${randomBytes(3).toString('hex')}.txt`
-  const payload = `s3proxy probe ${new Date().toISOString()}`
+  const client = createS3Client(account);
+  const probeKey = `${config.ADMIN_TEST_PREFIX}/${account.account_id}-${Date.now()}-${randomBytes(3).toString("hex")}.txt`;
+  const payload = `s3proxy probe ${new Date().toISOString()}`;
 
-  const timings = {}
-  const startedAt = Date.now()
+  const timings = {};
+  const startedAt = Date.now();
 
-  const t1 = Date.now()
-  await client.send(new ListObjectsV2Command({ Bucket: account.bucket, MaxKeys: 3 }))
-  timings.listMs = Date.now() - t1
+  const t1 = Date.now();
+  await client.send(new ListObjectsV2Command({ Bucket: account.bucket, MaxKeys: 3 }));
+  timings.listMs = Date.now() - t1;
 
-  const t2 = Date.now()
-  await client.send(new PutObjectCommand({
-    Bucket: account.bucket,
-    Key: probeKey,
-    Body: payload,
-    ContentType: 'text/plain; charset=utf-8',
-  }))
-  timings.putMs = Date.now() - t2
+  const t2 = Date.now();
+  await client.send(
+    new PutObjectCommand({
+      Bucket: account.bucket,
+      Key: probeKey,
+      Body: payload,
+      ContentType: "text/plain; charset=utf-8",
+    }),
+  );
+  timings.putMs = Date.now() - t2;
 
-  const t3 = Date.now()
-  const getResult = await client.send(new GetObjectCommand({ Bucket: account.bucket, Key: probeKey }))
-  const fetchedPayload = await readStreamBodyToString(getResult.Body)
-  timings.getMs = Date.now() - t3
+  const t3 = Date.now();
+  const getResult = await client.send(new GetObjectCommand({ Bucket: account.bucket, Key: probeKey }));
+  const fetchedPayload = await readStreamBodyToString(getResult.Body);
+  timings.getMs = Date.now() - t3;
 
-  const t4 = Date.now()
-  await client.send(new DeleteObjectCommand({ Bucket: account.bucket, Key: probeKey }))
-  timings.deleteMs = Date.now() - t4
+  const t4 = Date.now();
+  await client.send(new DeleteObjectCommand({ Bucket: account.bucket, Key: probeKey }));
+  timings.deleteMs = Date.now() - t4;
 
   return {
     accountId: account.account_id,
@@ -709,65 +819,63 @@ async function runS3Probe(account) {
     bytes: payload.length,
     durationMs: Date.now() - startedAt,
     timings,
-  }
+  };
 }
 
 function parseBodyObject(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return {}
-  return body
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  return body;
 }
 
 function normalizeQueryString(value) {
-  return String(value ?? '').trim()
+  return String(value ?? "").trim();
 }
 
 function getPayloadStream(request) {
-  if (request.body && typeof request.body.pipe === 'function') {
-    return request.body
+  if (request.body && typeof request.body.pipe === "function") {
+    return request.body;
   }
   if (Buffer.isBuffer(request.body)) {
-    return Readable.from(request.body)
+    return Readable.from(request.body);
   }
   if (request.body instanceof Uint8Array) {
-    return Readable.from(Buffer.from(request.body))
+    return Readable.from(Buffer.from(request.body));
   }
-  if (typeof request.body === 'string') {
-    return Readable.from(Buffer.from(request.body))
+  if (typeof request.body === "string") {
+    return Readable.from(Buffer.from(request.body));
   }
-  return request.raw
+  return request.raw;
 }
 
 async function readRequestBodyBuffer(request, maxBytes = 250 * 1024 * 1024) {
-  if (Buffer.isBuffer(request.body)) return request.body
-  if (request.body instanceof Uint8Array) return Buffer.from(request.body)
-  if (typeof request.body === 'string') return Buffer.from(request.body)
+  if (Buffer.isBuffer(request.body)) return request.body;
+  if (request.body instanceof Uint8Array) return Buffer.from(request.body);
+  if (typeof request.body === "string") return Buffer.from(request.body);
 
-  const source = request.body && typeof request.body[Symbol.asyncIterator] === 'function'
-    ? request.body
-    : request.raw
+  const source = request.body && typeof request.body[Symbol.asyncIterator] === "function" ? request.body : request.raw;
 
-  const chunks = []
-  let total = 0
+  const chunks = [];
+  let total = 0;
 
   for await (const chunk of source) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    total += buffer.length
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
     if (total > maxBytes) {
-      const err = new Error(`Request body exceeds ${maxBytes} bytes`)
-      err.statusCode = 413
-      throw err
+      const err = new Error(`Request body exceeds ${maxBytes} bytes`);
+      err.statusCode = 413;
+      throw err;
     }
-    chunks.push(buffer)
+    chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks)
+  return Buffer.concat(chunks);
 }
 
 function getManagedFileDirectUrl(route) {
-  if (!route) return null
-  if ((route.route_scope ?? ROUTE_SCOPE.MAIN) !== ROUTE_SCOPE.PUBLIC) return null
-  const account = getAccountById(route.account_id)
-  return route.public_url ?? buildDirectPublicObjectUrl(account, route.backend_key)
+  if (!route) return null;
+  if ((route.route_scope ?? ROUTE_SCOPE.MAIN) !== ROUTE_SCOPE.PUBLIC) return null;
+  const account = getAccountById(route.account_id);
+  return route.public_url ?? buildDirectPublicObjectUrl(account, route.backend_key);
 }
 
 function toAdminTrackedFile(route) {
@@ -781,7 +889,7 @@ function toAdminTrackedFile(route) {
     state: route.state,
     syncState: route.sync_state,
     reconcileStatus: route.reconcile_status,
-    contentType: route.content_type ?? 'application/octet-stream',
+    contentType: route.content_type ?? "application/octet-stream",
     sizeBytes: route.size_bytes ?? 0,
     etag: route.etag ?? null,
     uploadedAt: route.uploaded_at ?? null,
@@ -790,44 +898,38 @@ function toAdminTrackedFile(route) {
     deletedAt: route.deleted_at ?? null,
     metadataVersion: route.metadata_version ?? 1,
     publicUrl: getManagedFileDirectUrl(route),
-  }
+  };
 }
 
 function isDeletedRoute(route) {
-  return !route || route.state === ROUTE_STATE.DELETED || route.deleted_at !== null
+  return !route || route.state === ROUTE_STATE.DELETED || route.deleted_at !== null;
 }
 
 function matchesManagedFileSearch(route, search) {
-  if (!search) return true
-  const haystack = [
-    route.account_id,
-    route.bucket,
-    route.object_key,
-    route.backend_key,
-    route.route_scope,
-    route.content_type,
-    route.state,
-  ].join('\n').toLowerCase()
-  return haystack.includes(search.toLowerCase())
+  if (!search) return true;
+  const haystack = [route.account_id, route.bucket, route.object_key, route.backend_key, route.route_scope, route.content_type, route.state]
+    .join("\n")
+    .toLowerCase();
+  return haystack.includes(search.toLowerCase());
 }
 
 async function syncRouteAndAccountUsage(routeResult, request) {
-  if (!routeResult?.route) return
-  syncAccountsFromRows(routeResult.affectedAccounts ?? [])
-  refreshMetadataMetrics()
+  if (!routeResult?.route) return;
+  syncAccountsFromRows(routeResult.affectedAccounts ?? []);
+  refreshMetadataMetrics();
 
   try {
-    await syncRouteToRtdb(routeResult.route)
+    await syncRouteToRtdb(routeResult.route);
   } catch (err) {
-    request.log.warn({ err, encodedKey: routeResult.route.encoded_key }, 'admin route RTDB sync failed')
+    request.log.warn({ err, encodedKey: routeResult.route.encoded_key }, "admin route RTDB sync failed");
   }
 
-  await syncAccountsUsageBatch(routeResult.affectedAccounts ?? [], request.log)
+  await syncAccountsUsageBatch(routeResult.affectedAccounts ?? [], request.log);
 }
 
 function toAdminPublicFile(route) {
-  const account = getAccountById(route.account_id)
-  const directUrl = route.public_url ?? buildDirectPublicObjectUrl(account, route.backend_key)
+  const account = getAccountById(route.account_id);
+  const directUrl = route.public_url ?? buildDirectPublicObjectUrl(account, route.backend_key);
 
   return {
     path: route.object_key,
@@ -836,7 +938,7 @@ function toAdminPublicFile(route) {
     bucket: route.bucket ?? PUBLIC_PROXY_BUCKET,
     directUrl,
     accountId: route.account_id,
-    contentType: route.content_type ?? 'application/octet-stream',
+    contentType: route.content_type ?? "application/octet-stream",
     sizeBytes: route.size_bytes ?? 0,
     etag: route.etag ?? null,
     uploadedAt: route.uploaded_at ?? null,
@@ -845,781 +947,877 @@ function toAdminPublicFile(route) {
     metadataVersion: route.metadata_version ?? 1,
     routeScope: route.route_scope ?? ROUTE_SCOPE.PUBLIC,
     state: route.state,
-  }
+  };
 }
 
 export default async function adminRoutes(fastify, _opts) {
   try {
-    fastify.addContentTypeParser('*', (request, payload, done) => done(null, payload))
+    fastify.addContentTypeParser("*", (request, payload, done) => done(null, payload));
   } catch {
     // parser may already exist in current encapsulation context.
   }
 
-  fastify.get('/admin', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    reply.type('text/html; charset=utf-8').send(adminHtml)
-  })
+  fastify.get(
+    "/admin",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      reply.type("text/html; charset=utf-8").send(adminHtml);
+    },
+  );
 
-  fastify.get('/admin/icon.svg', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    reply.type('image/svg+xml; charset=utf-8').send(adminIcon)
-  })
+  fastify.get(
+    "/admin/icon.svg",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      reply.type("image/svg+xml; charset=utf-8").send(adminIcon);
+    },
+  );
 
-  fastify.get('/admin/manifest.webmanifest', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    reply.type('application/manifest+json').send({
-      name: 'S3Proxy Admin',
-      short_name: 'S3Proxy',
-      description: 'Admin console for S3Proxy accounts, probes and cron jobs',
-      start_url: '/admin',
-      scope: '/admin/',
-      display: 'standalone',
-      background_color: '#0b1020',
-      theme_color: '#0b1020',
-      icons: [{
-        src: '/admin/icon.svg',
-        sizes: 'any',
-        type: 'image/svg+xml',
-        purpose: 'any maskable',
-      }],
-    })
-  })
+  fastify.get(
+    "/admin/manifest.webmanifest",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      reply.type("application/manifest+json").send({
+        name: "S3Proxy Admin",
+        short_name: "S3Proxy",
+        description: "Admin console for S3Proxy accounts, probes and cron jobs",
+        start_url: "/admin",
+        scope: "/admin/",
+        display: "standalone",
+        background_color: "#0b1020",
+        theme_color: "#0b1020",
+        icons: [
+          {
+            src: "/admin/icon.svg",
+            sizes: "any",
+            type: "image/svg+xml",
+            purpose: "any maskable",
+          },
+        ],
+      });
+    },
+  );
 
-  fastify.get('/admin/sw.js', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    reply.type('application/javascript; charset=utf-8').send(adminServiceWorker)
-  })
+  fastify.get(
+    "/admin/sw.js",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      reply.type("application/javascript; charset=utf-8").send(adminServiceWorker);
+    },
+  );
 
-  fastify.get('/admin/api/overview', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    const stats = getAccountsStats()
-    const accounts = getAllAccounts().map(toPublicAccount)
-    const rtdb = getRtdbState()
+  fastify.get(
+    "/admin/api/overview",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      const stats = getAccountsStats();
+      const accounts = getAllAccounts().map(toPublicAccount);
+      const rtdb = getRtdbState();
 
-    reply.send({
-      status: rtdb.connected ? 'ok' : 'degraded',
-      instanceId: config.INSTANCE_ID,
-      deployVersion: config.DEPLOY_VERSION,
-      stats,
-      rtdb,
-      jobs: listCronJobs(),
-      cronKinds: getCronJobKinds(),
-      accounts,
-      runnerInfo: collectEnvPrefix(RUNNER_INFO_PREFIX),
-      dockerAccess: {
-        urls: deriveDockerAccessEntriesFromEnv(),
-        customEnv: collectEnvPrefix(DOCKER_ACCESS_URL_PREFIX),
-        context: {
-          projectName: normalizeString(process.env.PROJECT_NAME),
-          domain: normalizeString(process.env.DOMAIN),
-          tailscaleTailnetDomain: normalizeString(process.env.TAILSCALE_TAILNET_DOMAIN),
-          dozzleHostPort: normalizeString(process.env.DOZZLE_HOST_PORT),
-          filebrowserHostPort: normalizeString(process.env.FILEBROWSER_HOST_PORT),
-          websshHostPort: normalizeString(process.env.WEBSSH_HOST_PORT),
+      reply.send({
+        status: rtdb.connected ? "ok" : "degraded",
+        instanceId: config.INSTANCE_ID,
+        deployVersion: config.DEPLOY_VERSION,
+        stats,
+        rtdb,
+        jobs: listCronJobs(),
+        cronKinds: getCronJobKinds(),
+        accounts,
+        runnerInfo: collectEnvPrefix(RUNNER_INFO_PREFIX),
+        dockerAccess: deriveDockerAccessFromEnv(),
+      });
+    },
+  );
+
+  fastify.get(
+    "/admin/api/public-files",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const prefix = normalizeQueryString(request.query?.prefix);
+      const files = listPublicRoutes(prefix).map(toAdminPublicFile);
+      return reply.send({
+        ok: true,
+        total: files.length,
+        files,
+      });
+    },
+  );
+
+  fastify.get(
+    "/admin/api/files",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const accountId = normalizeQueryString(request.query?.accountId);
+      const scope = normalizeQueryString(request.query?.scope).toLowerCase();
+      const search = normalizeQueryString(request.query?.search);
+
+      let routes = getAllRoutes().filter((route) => !isDeletedRoute(route));
+
+      if (accountId) {
+        routes = routes.filter((route) => route.account_id === accountId);
+      }
+
+      if ([ROUTE_SCOPE.MAIN, ROUTE_SCOPE.PUBLIC].includes(scope)) {
+        routes = routes.filter((route) => (route.route_scope ?? ROUTE_SCOPE.MAIN) === scope);
+      }
+
+      if (search) {
+        routes = routes.filter((route) => matchesManagedFileSearch(route, search));
+      }
+
+      const files = routes.map(toAdminTrackedFile);
+      return reply.send({
+        ok: true,
+        total: files.length,
+        files,
+      });
+    },
+  );
+
+  fastify.get(
+    "/admin/api/accounts",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      const accounts = getAllAccounts().map(toPublicAccount);
+      return reply.send({
+        total: accounts.length,
+        accounts,
+      });
+    },
+  );
+
+  fastify.post(
+    "/admin/api/account-services/preview",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const payload = parseBodyObject(request.body);
+      const rawInput = String(payload.rawInput ?? payload.rawText ?? payload.raw ?? "");
+
+      if (!rawInput.trim()) {
+        return reply.code(400).send({
+          ok: false,
+          error: "rawInput is required",
+        });
+      }
+
+      const requestedServices = Array.isArray(payload.services)
+        ? payload.services.map((item) => normalizeString(item)).filter(Boolean)
+        : [normalizeString(payload.service)].filter(Boolean);
+      const bucketNameOverride = normalizeString(payload.bucketName ?? payload.preferredBucketName) || undefined;
+
+      request.log.info(
+        {
+          requestedServices: requestedServices.length > 0 ? requestedServices : ["supabaseS3"],
+          rawInputLength: rawInput.length,
+          lookupRemote: payload.lookupRemote === true,
+          createBucketIfMissing: payload.createBucketIfMissing === true,
+          bucketNameOverride: bucketNameOverride ?? null,
         },
-      },
-    })
-  })
+        "admin account service preview requested",
+      );
 
-  fastify.get('/admin/api/public-files', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const prefix = normalizeQueryString(request.query?.prefix)
-    const files = listPublicRoutes(prefix).map(toAdminPublicFile)
-    return reply.send({
-      ok: true,
-      total: files.length,
-      files,
-    })
-  })
+      const useSupabaseS3 = requestedServices.length === 0 || requestedServices.includes("supabaseS3");
+      if (!useSupabaseS3) {
+        return reply.code(400).send({
+          ok: false,
+          error: "Only service `supabaseS3` is supported in this version",
+        });
+      }
 
-  fastify.get('/admin/api/files', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const accountId = normalizeQueryString(request.query?.accountId)
-    const scope = normalizeQueryString(request.query?.scope).toLowerCase()
-    const search = normalizeQueryString(request.query?.search)
+      const preview = await previewSupabaseS3(rawInput, {
+        lookupRemote: payload.lookupRemote === true,
+        createBucketIfMissing: payload.createBucketIfMissing === true,
+        bucketName: bucketNameOverride,
+      });
 
-    let routes = getAllRoutes().filter((route) => !isDeletedRoute(route))
+      request.log.info(
+        {
+          service: "supabaseS3",
+          missingRequired: preview.missingRequired ?? [],
+          warningCount: Array.isArray(preview.warnings) ? preview.warnings.length : 0,
+          remote: {
+            attempted: preview.remote?.attempted === true,
+            ok: preview.remote?.ok === true,
+            fallbackToLocal: preview.remote?.fallbackToLocal === true,
+            bucketResolved: preview.remote?.bucketResolved ?? null,
+            bucketCreated: preview.remote?.bucketCreated === true,
+            error: preview.remote?.error ?? null,
+          },
+        },
+        "admin account service preview completed",
+      );
 
-    if (accountId) {
-      routes = routes.filter((route) => route.account_id === accountId)
-    }
+      if (Array.isArray(preview.warnings) && preview.warnings.length > 0) {
+        request.log.warn(
+          {
+            service: "supabaseS3",
+            warnings: preview.warnings,
+          },
+          "admin account service preview has warnings",
+        );
+      }
 
-    if ([ROUTE_SCOPE.MAIN, ROUTE_SCOPE.PUBLIC].includes(scope)) {
-      routes = routes.filter((route) => (route.route_scope ?? ROUTE_SCOPE.MAIN) === scope)
-    }
+      return reply.send({
+        ok: true,
+        service: "supabaseS3",
+        preview,
+      });
+    },
+  );
 
-    if (search) {
-      routes = routes.filter((route) => matchesManagedFileSearch(route, search))
-    }
+  fastify.post(
+    "/admin/api/accounts",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const payload = parseBodyObject(request.body);
+      const incomingLog = toIncomingAccountLog(payload);
+      request.log.info({ incoming: incomingLog }, "admin account upsert requested");
 
-    const files = routes.map(toAdminTrackedFile)
-    return reply.send({
-      ok: true,
-      total: files.length,
-      files,
-    })
-  })
+      const requestedId = normalizeString(payload.accountId ?? payload.account_id);
+      const existing = requestedId ? getAccountById(requestedId) : null;
+      const normalized = normalizeAccountPayload(payload, existing);
 
-  fastify.get('/admin/api/accounts', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    const accounts = getAllAccounts().map(toPublicAccount)
-    return reply.send({
-      total: accounts.length,
-      accounts,
-    })
-  })
+      if (normalized.errors.length > 0 || !normalized.row) {
+        request.log.warn(
+          {
+            requestedId: requestedId || null,
+            errors: normalized.errors,
+          },
+          "admin account upsert validation failed",
+        );
+        return reply.code(400).send({
+          ok: false,
+          error: "Invalid account payload",
+          errors: normalized.errors,
+        });
+      }
 
-  fastify.post('/admin/api/account-services/preview', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const payload = parseBodyObject(request.body)
-    const rawInput = String(payload.rawInput ?? payload.rawText ?? payload.raw ?? '')
-
-    if (!rawInput.trim()) {
-      return reply.code(400).send({
-        ok: false,
-        error: 'rawInput is required',
-      })
-    }
-
-    const requestedServices = Array.isArray(payload.services)
-      ? payload.services.map((item) => normalizeString(item)).filter(Boolean)
-      : [normalizeString(payload.service)].filter(Boolean)
-    const bucketNameOverride = normalizeString(payload.bucketName ?? payload.preferredBucketName) || undefined
-
-    request.log.info({
-      requestedServices: requestedServices.length > 0 ? requestedServices : ['supabaseS3'],
-      rawInputLength: rawInput.length,
-      lookupRemote: payload.lookupRemote === true,
-      createBucketIfMissing: payload.createBucketIfMissing === true,
-      bucketNameOverride: bucketNameOverride ?? null,
-    }, 'admin account service preview requested')
-
-    const useSupabaseS3 = requestedServices.length === 0 || requestedServices.includes('supabaseS3')
-    if (!useSupabaseS3) {
-      return reply.code(400).send({
-        ok: false,
-        error: 'Only service `supabaseS3` is supported in this version',
-      })
-    }
-
-    const preview = await previewSupabaseS3(rawInput, {
-      lookupRemote: payload.lookupRemote === true,
-      createBucketIfMissing: payload.createBucketIfMissing === true,
-      bucketName: bucketNameOverride,
-    })
-
-    request.log.info({
-      service: 'supabaseS3',
-      missingRequired: preview.missingRequired ?? [],
-      warningCount: Array.isArray(preview.warnings) ? preview.warnings.length : 0,
-      remote: {
-        attempted: preview.remote?.attempted === true,
-        ok: preview.remote?.ok === true,
-        fallbackToLocal: preview.remote?.fallbackToLocal === true,
-        bucketResolved: preview.remote?.bucketResolved ?? null,
-        bucketCreated: preview.remote?.bucketCreated === true,
-        error: preview.remote?.error ?? null,
-      },
-    }, 'admin account service preview completed')
-
-    if (Array.isArray(preview.warnings) && preview.warnings.length > 0) {
-      request.log.warn({
-        service: 'supabaseS3',
-        warnings: preview.warnings,
-      }, 'admin account service preview has warnings')
-    }
-
-    return reply.send({
-      ok: true,
-      service: 'supabaseS3',
-      preview,
-    })
-  })
-
-  fastify.post('/admin/api/accounts', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const payload = parseBodyObject(request.body)
-    const incomingLog = toIncomingAccountLog(payload)
-    request.log.info({ incoming: incomingLog }, 'admin account upsert requested')
-
-    const requestedId = normalizeString(payload.accountId ?? payload.account_id)
-    const existing = requestedId ? getAccountById(requestedId) : null
-    const normalized = normalizeAccountPayload(payload, existing)
-
-    if (normalized.errors.length > 0 || !normalized.row) {
-      request.log.warn({
-        requestedId: requestedId || null,
-        errors: normalized.errors,
-      }, 'admin account upsert validation failed')
-      return reply.code(400).send({
-        ok: false,
-        error: 'Invalid account payload',
-        errors: normalized.errors,
-      })
-    }
-
-    const originalRegion = normalized.row.region
-    const signingRegion = resolveS3SigningRegion({
-      endpoint: normalized.row.endpoint,
-      region: originalRegion,
-    })
-    const regionWasNormalized = signingRegion !== originalRegion
-    if (regionWasNormalized) {
-      normalized.row.region = signingRegion
-      request.log.info({
-        accountId: normalized.row.account_id,
+      const originalRegion = normalized.row.region;
+      const signingRegion = resolveS3SigningRegion({
         endpoint: normalized.row.endpoint,
-        regionInput: originalRegion,
-        regionApplied: signingRegion,
-      }, 'admin account signing region normalized')
-    }
+        region: originalRegion,
+      });
+      const regionWasNormalized = signingRegion !== originalRegion;
+      if (regionWasNormalized) {
+        normalized.row.region = signingRegion;
+        request.log.info(
+          {
+            accountId: normalized.row.account_id,
+            endpoint: normalized.row.endpoint,
+            regionInput: originalRegion,
+            regionApplied: signingRegion,
+          },
+          "admin account signing region normalized",
+        );
+      }
 
-    request.log.info({
-      account: toSafeAccountLog(normalized.row),
-      existing: Boolean(existing),
-    }, 'admin account payload normalized')
+      request.log.info(
+        {
+          account: toSafeAccountLog(normalized.row),
+          existing: Boolean(existing),
+        },
+        "admin account payload normalized",
+      );
 
-    request.log.info({
-      accountId: normalized.row.account_id,
-      bucket: normalized.row.bucket,
-      endpoint: normalized.row.endpoint,
-      region: normalized.row.region,
-    }, 'admin account bucket verification started')
+      request.log.info(
+        {
+          accountId: normalized.row.account_id,
+          bucket: normalized.row.bucket,
+          endpoint: normalized.row.endpoint,
+          region: normalized.row.region,
+        },
+        "admin account bucket verification started",
+      );
 
-    const bucketVerification = await verifyBucketExists(normalized.row, request.log)
+      const bucketVerification = await verifyBucketExists(normalized.row, request.log);
 
-    if (bucketVerification.exists === false) {
-      request.log.warn({
-        accountId: normalized.row.account_id,
-        bucket: normalized.row.bucket,
+      if (bucketVerification.exists === false) {
+        request.log.warn(
+          {
+            accountId: normalized.row.account_id,
+            bucket: normalized.row.bucket,
+            bucketVerification,
+          },
+          "admin account upsert rejected because bucket was not found",
+        );
+
+        return reply.code(400).send({
+          ok: false,
+          error: `Bucket "${normalized.row.bucket}" does not exist`,
+          detail: bucketVerification.detail,
+          bucketVerification,
+        });
+      }
+
+      let bucketWarning = "";
+      if (bucketVerification.exists === null) {
+        bucketWarning = `Bucket "${normalized.row.bucket}" could not be verified automatically (${bucketVerification.detail}); account is still saved.`;
+        request.log.warn(
+          {
+            accountId: normalized.row.account_id,
+            bucket: normalized.row.bucket,
+            bucketVerification,
+          },
+          "admin account bucket verification inconclusive",
+        );
+      } else {
+        request.log.info(
+          {
+            accountId: normalized.row.account_id,
+            bucket: normalized.row.bucket,
+            verifiedBy: bucketVerification.verifiedBy,
+          },
+          "admin account bucket verification passed",
+        );
+      }
+
+      const beforeUpsert = getAccountById(normalized.row.account_id);
+      upsertAccount(normalized.row);
+      reloadAccountsFromSQLite();
+
+      const updates = {
+        [buildRtdbAccountPath(normalized.row.account_id)]: toRtdbAccountDocument(normalized.row),
+      };
+
+      let rtdbSynced = true;
+      const warnings = [];
+      if (regionWasNormalized) {
+        warnings.push(`Region normalized for Supabase S3 signing: ${originalRegion} -> ${signingRegion}`);
+      }
+      if (bucketWarning) warnings.push(bucketWarning);
+      try {
+        await rtdbBatchPatch(updates);
+        await reloadAccountsFromRTDB();
+      } catch (err) {
+        rtdbSynced = false;
+        warnings.push(`Account saved locally, but RTDB sync failed: ${err?.message ?? String(err)}`);
+        request.log.warn({ err, accountId: normalized.row.account_id }, "admin account sync failed");
+        reloadAccountsFromSQLite();
+      }
+
+      request.log.info(
+        {
+          accountId: normalized.row.account_id,
+          action: beforeUpsert ? "updated" : "created",
+          rtdbSynced,
+          warningCount: warnings.length,
+          bucketVerification: {
+            exists: bucketVerification.exists,
+            verifiedBy: bucketVerification.verifiedBy,
+          },
+        },
+        "admin account upsert completed",
+      );
+
+      return reply.send({
+        ok: true,
+        action: beforeUpsert ? "updated" : "created",
+        rtdbSynced,
+        warning: warnings.length > 0 ? warnings.join(" | ") : undefined,
         bucketVerification,
-      }, 'admin account upsert rejected because bucket was not found')
+        account: toPublicAccount(normalized.row),
+      });
+    },
+  );
 
-      return reply.code(400).send({
-        ok: false,
-        error: `Bucket "${normalized.row.bucket}" does not exist`,
-        detail: bucketVerification.detail,
-        bucketVerification,
-      })
-    }
+  fastify.delete(
+    "/admin/api/accounts/:accountId",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const accountId = normalizeString(request.params?.accountId);
+      request.log.info({ accountId: accountId || null }, "admin account delete requested");
 
-    let bucketWarning = ''
-    if (bucketVerification.exists === null) {
-      bucketWarning = `Bucket "${normalized.row.bucket}" could not be verified automatically (${bucketVerification.detail}); account is still saved.`
-      request.log.warn({
-        accountId: normalized.row.account_id,
-        bucket: normalized.row.bucket,
-        bucketVerification,
-      }, 'admin account bucket verification inconclusive')
-    } else {
-      request.log.info({
-        accountId: normalized.row.account_id,
-        bucket: normalized.row.bucket,
-        verifiedBy: bucketVerification.verifiedBy,
-      }, 'admin account bucket verification passed')
-    }
+      if (!accountId) {
+        return reply.code(400).send({ ok: false, error: "accountId is required" });
+      }
 
-    const beforeUpsert = getAccountById(normalized.row.account_id)
-    upsertAccount(normalized.row)
-    reloadAccountsFromSQLite()
+      const existing = getAccountById(accountId);
+      if (!existing) {
+        return reply.code(404).send({ ok: false, error: "account not found" });
+      }
 
-    const updates = {
-      [buildRtdbAccountPath(normalized.row.account_id)]: toRtdbAccountDocument(normalized.row),
-    }
-
-    let rtdbSynced = true
-    const warnings = []
-    if (regionWasNormalized) {
-      warnings.push(`Region normalized for Supabase S3 signing: ${originalRegion} -> ${signingRegion}`)
-    }
-    if (bucketWarning) warnings.push(bucketWarning)
-    try {
-      await rtdbBatchPatch(updates)
-      await reloadAccountsFromRTDB()
-    } catch (err) {
-      rtdbSynced = false
-      warnings.push(`Account saved locally, but RTDB sync failed: ${err?.message ?? String(err)}`)
-      request.log.warn({ err, accountId: normalized.row.account_id }, 'admin account sync failed')
-      reloadAccountsFromSQLite()
-    }
-
-    request.log.info({
-      accountId: normalized.row.account_id,
-      action: beforeUpsert ? 'updated' : 'created',
-      rtdbSynced,
-      warningCount: warnings.length,
-      bucketVerification: {
-        exists: bucketVerification.exists,
-        verifiedBy: bucketVerification.verifiedBy,
-      },
-    }, 'admin account upsert completed')
-
-    return reply.send({
-      ok: true,
-      action: beforeUpsert ? 'updated' : 'created',
-      rtdbSynced,
-      warning: warnings.length > 0 ? warnings.join(' | ') : undefined,
-      bucketVerification,
-      account: toPublicAccount(normalized.row),
-    })
-  })
-
-  fastify.delete('/admin/api/accounts/:accountId', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const accountId = normalizeString(request.params?.accountId)
-    request.log.info({ accountId: accountId || null }, 'admin account delete requested')
-
-    if (!accountId) {
-      return reply.code(400).send({ ok: false, error: 'accountId is required' })
-    }
-
-    const existing = getAccountById(accountId)
-    if (!existing) {
-      return reply.code(404).send({ ok: false, error: 'account not found' })
-    }
-
-    const trackedRoutes = getTrackedRoutesByAccount(accountId)
-    if (trackedRoutes.length > 0) {
-      return reply.code(409).send({
-        ok: false,
-        error: `account has ${trackedRoutes.length} tracked route(s), cannot delete`,
-      })
-    }
-
-    try {
-      deleteAccount(accountId)
-    } catch (err) {
-      const message = err?.message ?? String(err)
-      if (message.includes('FOREIGN KEY')) {
+      const trackedRoutes = getTrackedRoutesByAccount(accountId);
+      if (trackedRoutes.length > 0) {
         return reply.code(409).send({
           ok: false,
-          error: 'account still referenced by object metadata, cannot delete',
-        })
-      }
-      throw err
-    }
-    reloadAccountsFromSQLite()
-
-    let rtdbSynced = true
-    let warning = ''
-    try {
-      await rtdbBatchPatch({
-        [buildRtdbAccountPath(accountId)]: null,
-      })
-      await reloadAccountsFromRTDB()
-    } catch (err) {
-      rtdbSynced = false
-      warning = `Account deleted locally, but RTDB sync failed: ${err?.message ?? String(err)}`
-      request.log.warn({ err, accountId }, 'admin account delete sync failed')
-      reloadAccountsFromSQLite()
-    }
-
-    request.log.info({
-      accountId,
-      rtdbSynced,
-      warning: warning || null,
-    }, 'admin account delete completed')
-
-    return reply.send({
-      ok: true,
-      accountId,
-      rtdbSynced,
-      warning: warning || undefined,
-    })
-  })
-
-  fastify.put('/admin/api/files/:encodedKey', {
-    config: { skipAuth: true, rawBody: true },
-  }, async (request, reply) => {
-    const encodedKey = normalizeQueryString(request.params?.encodedKey)
-    if (!encodedKey) {
-      return reply.code(400).send({ ok: false, error: 'encodedKey is required' })
-    }
-
-    const existing = getAllRoutes().find((route) => route.encoded_key === encodedKey)
-    if (!existing || isDeletedRoute(existing)) {
-      return reply.code(404).send({ ok: false, error: 'tracked file not found' })
-    }
-
-    const account = getAccountById(existing.account_id)
-    if (!account) {
-      return reply.code(404).send({ ok: false, error: `backend account not found: ${existing.account_id}` })
-    }
-
-    let bodyBuffer
-    try {
-      bodyBuffer = await readRequestBodyBuffer(request)
-    } catch (err) {
-      const statusCode = Number(err?.statusCode) || 400
-      return reply.code(statusCode).send({ ok: false, error: err?.message ?? String(err) })
-    }
-
-    if (!bodyBuffer || bodyBuffer.length === 0) {
-      return reply.code(400).send({ ok: false, error: 'request body is empty' })
-    }
-
-    const contentType = normalizeQueryString(request.headers['x-file-content-type'])
-      || normalizeQueryString(request.headers['content-type'])
-      || existing.content_type
-      || 'application/octet-stream'
-
-    const client = createS3Client(account)
-    let putResult
-    try {
-      putResult = await client.send(new PutObjectCommand({
-        Bucket: account.bucket,
-        Key: existing.backend_key,
-        Body: bodyBuffer,
-        ContentType: contentType,
-      }))
-    } catch (err) {
-      return reply.code(502).send({ ok: false, error: err?.message ?? String(err) })
-    }
-
-    const now = Date.now()
-    const updated = commitUploadedObjectMetadata({
-      encoded_key: existing.encoded_key,
-      account_id: existing.account_id,
-      bucket: existing.bucket,
-      object_key: existing.object_key,
-      backend_key: existing.backend_key,
-      size_bytes: bodyBuffer.length,
-      etag: putResult?.ETag ? String(putResult.ETag).replace(/"/g, '') : existing.etag,
-      last_modified: now,
-      content_type: contentType,
-      uploaded_at: existing.uploaded_at ?? now,
-      updated_at: now,
-      public_url: existing.public_url ?? null,
-      route_scope: existing.route_scope ?? ROUTE_SCOPE.MAIN,
-      instance_id: config.INSTANCE_ID,
-    })
-
-    await syncRouteAndAccountUsage(updated, request)
-
-    return reply.send({
-      ok: true,
-      message: 'File replaced successfully',
-      file: toAdminTrackedFile(updated.route),
-    })
-  })
-
-  fastify.delete('/admin/api/files/:encodedKey', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const encodedKey = normalizeQueryString(request.params?.encodedKey)
-    if (!encodedKey) {
-      return reply.code(400).send({ ok: false, error: 'encodedKey is required' })
-    }
-
-    const existing = getAllRoutes().find((route) => route.encoded_key === encodedKey)
-    if (!existing || isDeletedRoute(existing)) {
-      return reply.code(404).send({ ok: false, error: 'tracked file not found' })
-    }
-
-    const account = getAccountById(existing.account_id)
-    if (!account) {
-      return reply.code(404).send({ ok: false, error: `backend account not found: ${existing.account_id}` })
-    }
-
-    const client = createS3Client(account)
-    try {
-      await client.send(new DeleteObjectCommand({
-        Bucket: account.bucket,
-        Key: existing.backend_key,
-      }))
-    } catch (err) {
-      const message = err?.message ?? String(err)
-      const statusCode = Number(err?.$metadata?.httpStatusCode) || 502
-      const lower = String(message).toLowerCase()
-      const missing = statusCode === 404 || lower.includes('nosuchkey') || lower.includes('not found')
-      if (!missing) {
-        return reply.code(502).send({ ok: false, error: message })
-      }
-    }
-
-    const deleted = finalizeRouteDelete(encodedKey, Date.now())
-    await syncRouteAndAccountUsage(deleted, request)
-
-    return reply.send({
-      ok: true,
-      message: 'File deleted successfully',
-      file: deleted.route ? toAdminTrackedFile(deleted.route) : null,
-    })
-  })
-
-  fastify.get('/admin/api/runtime-export', {
-    config: { skipAuth: true },
-  }, async (_request, reply) => {
-    const snapshot = {
-      version: 1,
-      exportedAt: Date.now(),
-      instanceId: config.INSTANCE_ID,
-      accounts: getAllAccounts().map(toPrivateExportAccount),
-      buckets: getAllBuckets(),
-      routes: getAllRoutes().map(toRuntimeExportRoute),
-    }
-
-    reply
-      .header('Content-Type', 'application/json; charset=utf-8')
-      .header('Content-Disposition', `attachment; filename="s3proxy-runtime-export-${Date.now()}.json"`)
-      .send(snapshot)
-  })
-
-  fastify.post('/admin/api/runtime-import', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const payload = parseBodyObject(request.body)
-    const accountsInput = Array.isArray(payload.accounts)
-      ? payload.accounts
-      : Object.values(payload.accounts ?? {})
-    const bucketsInput = Array.isArray(payload.buckets)
-      ? payload.buckets
-      : Object.values(payload.buckets ?? {})
-    const routesInput = Array.isArray(payload.routes)
-      ? payload.routes
-      : Object.values(payload.routes ?? {})
-
-    if (accountsInput.length === 0 && bucketsInput.length === 0 && routesInput.length === 0) {
-      return reply.code(400).send({
-        ok: false,
-        error: 'Payload must contain at least one of: accounts, buckets, routes',
-      })
-    }
-
-    const importedAccounts = []
-    for (const account of accountsInput) {
-      if (!account || typeof account !== 'object') continue
-      const normalized = toPrivateExportAccount({
-        ...account,
-        account_id: account.account_id ?? account.accountId,
-        access_key_id: account.access_key_id ?? account.accessKeyId,
-        secret_key: account.secret_key ?? account.secretAccessKey,
-        addressing_style: account.addressing_style ?? account.addressingStyle,
-        payload_signing_mode: account.payload_signing_mode ?? account.payloadSigningMode,
-        email_owner: account.email_owner ?? account.emailOwner,
-        supabase_access_token: account.supabase_access_token ?? account.supabaseAccessToken,
-        supabase_access_token_exp: account.supabase_access_token_exp
-          ?? account.supabaseAccessTokenExp
-          ?? account.supabaseAccessTokenExperimental,
-        public_bucket: account.public_bucket ?? account.publicBucket,
-        quota_bytes: account.quota_bytes ?? account.quotaBytes,
-        used_bytes: account.used_bytes ?? account.usedBytes,
-        added_at: account.added_at ?? account.addedAt,
-      })
-      if (!normalized.account_id) continue
-      upsertAccount(normalized)
-      importedAccounts.push(normalized)
-    }
-
-    const importedBuckets = []
-    for (const bucket of bucketsInput) {
-      if (!bucket || typeof bucket !== 'object' || !bucket.bucket) continue
-      importedBuckets.push(upsertBucketRecord({
-        bucket: bucket.bucket,
-        created_at: bucket.created_at ?? bucket.createdAt,
-        updated_at: bucket.updated_at ?? bucket.updatedAt,
-        deleted_at: bucket.deleted_at ?? bucket.deletedAt ?? null,
-        versioning_status: bucket.versioning_status ?? bucket.versioningStatus ?? '',
-      }))
-    }
-
-    const importedRoutes = []
-    for (const route of routesInput) {
-      if (!route || typeof route !== 'object') continue
-      const normalized = {
-        ...route,
-        encoded_key: route.encoded_key
-          ?? route.encodedKey
-          ?? (route.bucket && route.object_key ? encodeKey(route.bucket, route.object_key) : null),
-        account_id: route.account_id ?? route.accountId,
-        object_key: route.object_key ?? route.objectKey,
-        backend_key: route.backend_key ?? route.backendKey,
-        size_bytes: route.size_bytes ?? route.sizeBytes ?? 0,
-        last_modified: route.last_modified ?? route.lastModified ?? route.uploaded_at ?? route.uploadedAt ?? Date.now(),
-        content_type: route.content_type ?? route.contentType ?? null,
-        uploaded_at: route.uploaded_at ?? route.uploadedAt ?? Date.now(),
-        updated_at: route.updated_at ?? route.updatedAt ?? Date.now(),
-        deleted_at: route.deleted_at ?? route.deletedAt ?? null,
-        metadata_version: route.metadata_version ?? route.metadataVersion ?? 1,
-        route_scope: route.route_scope ?? route.routeScope ?? ROUTE_SCOPE.MAIN,
-        public_url: route.public_url ?? route.publicUrl ?? null,
-        state: route.state ?? ROUTE_STATE.ACTIVE,
-        sync_state: route.sync_state ?? route.syncState ?? 'PENDING_SYNC',
-        reconcile_status: route.reconcile_status ?? route.reconcileStatus ?? ROUTE_RECONCILE_STATUS.HEALTHY,
-        backend_last_seen_at: route.backend_last_seen_at ?? route.backendLastSeenAt ?? null,
-        backend_missing_since: route.backend_missing_since ?? route.backendMissingSince ?? null,
-        last_reconciled_at: route.last_reconciled_at ?? route.lastReconciledAt ?? null,
-        instance_id: route.instance_id ?? route.instanceId ?? config.INSTANCE_ID,
+          error: `account has ${trackedRoutes.length} tracked route(s), cannot delete`,
+        });
       }
 
-      if (!normalized.encoded_key || !normalized.account_id || !normalized.bucket || !normalized.object_key) {
-        continue
-      }
-
-      upsertRoute(normalized)
-      importedRoutes.push(normalized)
-    }
-
-    reloadAccountsFromSQLite()
-
-    let rtdbSynced = true
-    let warning = ''
-    try {
-      const updates = {
-        ...Object.fromEntries(importedAccounts.map((account) => [buildRtdbAccountPath(account.account_id), toRtdbAccountDocument(account)])),
-        ...Object.fromEntries(importedRoutes.map((route) => [`/routes/${route.encoded_key}`, buildRtdbRouteDocument(route)])),
-      }
-
-      if (Object.keys(updates).length > 0) {
-        await rtdbBatchPatch(updates)
-        await reloadAccountsFromRTDB()
-      }
-    } catch (err) {
-      rtdbSynced = false
-      warning = `Runtime metadata imported locally, but RTDB sync failed: ${err?.message ?? String(err)}`
-      request.log.warn({ err }, 'runtime import RTDB sync failed')
-      reloadAccountsFromSQLite()
-    }
-
-    return reply.send({
-      ok: true,
-      imported: {
-        accounts: importedAccounts.length,
-        buckets: importedBuckets.length,
-        routes: importedRoutes.length,
-        publicFiles: importedRoutes.filter((route) => route.route_scope === ROUTE_SCOPE.PUBLIC).length,
-      },
-      rtdbSynced,
-      warning: warning || undefined,
-    })
-  })
-
-  fastify.post('/admin/api/cron-jobs', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    try {
-      const saved = saveCronJob(parseBodyObject(request.body))
-      return reply.send({ ok: true, job: saved })
-    } catch (err) {
-      return reply.code(400).send({ ok: false, error: err?.message ?? String(err) })
-    }
-  })
-
-  fastify.post('/admin/api/cron-jobs/:jobId/run', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    try {
-      const payload = parseBodyObject(request.body)
-      const result = await runCronJobNow(request.params.jobId, {
-        overridePayload: payload.payload && typeof payload.payload === 'object' && !Array.isArray(payload.payload)
-          ? payload.payload
-          : undefined,
-      })
-      return reply.send({
-        ok: result.lastRunStatus === 'ok',
-        jobId: result.job_id,
-        jobName: result.name,
-        kind: result.kind,
-        source: result.source,
-        manualOnly: result.manualOnly === true,
-        apiPath: result.apiPath,
-        lastRunStatus: result.lastRunStatus,
-        lastRunError: result.lastRunError,
-        report: result.lastRunReport ?? null,
-      })
-    } catch (err) {
-      return reply.code(404).send({ ok: false, error: err?.message ?? String(err) })
-    }
-  })
-
-  fastify.post('/api/cron-jobs/:jobId/run', async (request, reply) => {
-    try {
-      const payload = parseBodyObject(request.body)
-      const result = await runCronJobNow(request.params.jobId, {
-        overridePayload: payload.payload && typeof payload.payload === 'object' && !Array.isArray(payload.payload)
-          ? payload.payload
-          : undefined,
-      })
-      return reply.send({
-        ok: result.lastRunStatus === 'ok',
-        jobId: result.job_id,
-        jobName: result.name,
-        kind: result.kind,
-        source: result.source,
-        manualOnly: result.manualOnly === true,
-        apiPath: result.apiPath,
-        lastRunStatus: result.lastRunStatus,
-        lastRunError: result.lastRunError,
-        report: result.lastRunReport ?? null,
-      })
-    } catch (err) {
-      const message = err?.message ?? String(err)
-      const statusCode = /not found/i.test(message) ? 404 : 400
-      return reply.code(statusCode).send({ ok: false, error: message })
-    }
-  })
-
-  fastify.delete('/admin/api/cron-jobs/:jobId', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    try {
-      const removed = removeCronJob(request.params.jobId)
-      if (!removed) {
-        return reply.code(404).send({ ok: false, error: 'job not found' })
-      }
-      return reply.send({ ok: true })
-    } catch (err) {
-      return reply.code(400).send({ ok: false, error: err?.message ?? String(err) })
-    }
-  })
-
-  fastify.post('/admin/api/test-s3', {
-    config: { skipAuth: true },
-  }, async (request, reply) => {
-    const payload = parseBodyObject(request.body)
-    const all = getAllAccounts().filter((item) => item.active === 1 || item.active === true)
-
-    let targets = []
-    if (payload.allActive === true) {
-      targets = all
-    } else if (payload.accountId) {
-      targets = all.filter((item) => item.account_id === String(payload.accountId))
-    }
-
-    if (targets.length === 0) {
-      return reply.code(400).send({ ok: false, error: 'account not found or inactive' })
-    }
-
-    const results = []
-    for (const account of targets) {
       try {
-        const result = await runS3Probe(account)
-        results.push(result)
+        deleteAccount(accountId);
       } catch (err) {
-        results.push({
-          accountId: account.account_id,
-          bucket: account.bucket,
-          ok: false,
-          error: err?.message ?? String(err),
-        })
+        const message = err?.message ?? String(err);
+        if (message.includes("FOREIGN KEY")) {
+          return reply.code(409).send({
+            ok: false,
+            error: "account still referenced by object metadata, cannot delete",
+          });
+        }
+        throw err;
       }
-    }
+      reloadAccountsFromSQLite();
 
-    return reply.send({
-      ok: results.every((item) => item.ok),
-      count: results.length,
-      results,
-    })
-  })
+      let rtdbSynced = true;
+      let warning = "";
+      try {
+        await rtdbBatchPatch({
+          [buildRtdbAccountPath(accountId)]: null,
+        });
+        await reloadAccountsFromRTDB();
+      } catch (err) {
+        rtdbSynced = false;
+        warning = `Account deleted locally, but RTDB sync failed: ${err?.message ?? String(err)}`;
+        request.log.warn({ err, accountId }, "admin account delete sync failed");
+        reloadAccountsFromSQLite();
+      }
+
+      request.log.info(
+        {
+          accountId,
+          rtdbSynced,
+          warning: warning || null,
+        },
+        "admin account delete completed",
+      );
+
+      return reply.send({
+        ok: true,
+        accountId,
+        rtdbSynced,
+        warning: warning || undefined,
+      });
+    },
+  );
+
+  fastify.put(
+    "/admin/api/files/:encodedKey",
+    {
+      config: { skipAuth: true, rawBody: true },
+    },
+    async (request, reply) => {
+      const encodedKey = normalizeQueryString(request.params?.encodedKey);
+      if (!encodedKey) {
+        return reply.code(400).send({ ok: false, error: "encodedKey is required" });
+      }
+
+      const existing = getAllRoutes().find((route) => route.encoded_key === encodedKey);
+      if (!existing || isDeletedRoute(existing)) {
+        return reply.code(404).send({ ok: false, error: "tracked file not found" });
+      }
+
+      const account = getAccountById(existing.account_id);
+      if (!account) {
+        return reply.code(404).send({ ok: false, error: `backend account not found: ${existing.account_id}` });
+      }
+
+      let bodyBuffer;
+      try {
+        bodyBuffer = await readRequestBodyBuffer(request);
+      } catch (err) {
+        const statusCode = Number(err?.statusCode) || 400;
+        return reply.code(statusCode).send({ ok: false, error: err?.message ?? String(err) });
+      }
+
+      if (!bodyBuffer || bodyBuffer.length === 0) {
+        return reply.code(400).send({ ok: false, error: "request body is empty" });
+      }
+
+      const contentType =
+        normalizeQueryString(request.headers["x-file-content-type"]) ||
+        normalizeQueryString(request.headers["content-type"]) ||
+        existing.content_type ||
+        "application/octet-stream";
+
+      const client = createS3Client(account);
+      let putResult;
+      try {
+        putResult = await client.send(
+          new PutObjectCommand({
+            Bucket: account.bucket,
+            Key: existing.backend_key,
+            Body: bodyBuffer,
+            ContentType: contentType,
+          }),
+        );
+      } catch (err) {
+        return reply.code(502).send({ ok: false, error: err?.message ?? String(err) });
+      }
+
+      const now = Date.now();
+      const updated = commitUploadedObjectMetadata({
+        encoded_key: existing.encoded_key,
+        account_id: existing.account_id,
+        bucket: existing.bucket,
+        object_key: existing.object_key,
+        backend_key: existing.backend_key,
+        size_bytes: bodyBuffer.length,
+        etag: putResult?.ETag ? String(putResult.ETag).replace(/"/g, "") : existing.etag,
+        last_modified: now,
+        content_type: contentType,
+        uploaded_at: existing.uploaded_at ?? now,
+        updated_at: now,
+        public_url: existing.public_url ?? null,
+        route_scope: existing.route_scope ?? ROUTE_SCOPE.MAIN,
+        instance_id: config.INSTANCE_ID,
+      });
+
+      await syncRouteAndAccountUsage(updated, request);
+
+      return reply.send({
+        ok: true,
+        message: "File replaced successfully",
+        file: toAdminTrackedFile(updated.route),
+      });
+    },
+  );
+
+  fastify.delete(
+    "/admin/api/files/:encodedKey",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const encodedKey = normalizeQueryString(request.params?.encodedKey);
+      if (!encodedKey) {
+        return reply.code(400).send({ ok: false, error: "encodedKey is required" });
+      }
+
+      const existing = getAllRoutes().find((route) => route.encoded_key === encodedKey);
+      if (!existing || isDeletedRoute(existing)) {
+        return reply.code(404).send({ ok: false, error: "tracked file not found" });
+      }
+
+      const account = getAccountById(existing.account_id);
+      if (!account) {
+        return reply.code(404).send({ ok: false, error: `backend account not found: ${existing.account_id}` });
+      }
+
+      const client = createS3Client(account);
+      try {
+        await client.send(
+          new DeleteObjectCommand({
+            Bucket: account.bucket,
+            Key: existing.backend_key,
+          }),
+        );
+      } catch (err) {
+        const message = err?.message ?? String(err);
+        const statusCode = Number(err?.$metadata?.httpStatusCode) || 502;
+        const lower = String(message).toLowerCase();
+        const missing = statusCode === 404 || lower.includes("nosuchkey") || lower.includes("not found");
+        if (!missing) {
+          return reply.code(502).send({ ok: false, error: message });
+        }
+      }
+
+      const deleted = finalizeRouteDelete(encodedKey, Date.now());
+      await syncRouteAndAccountUsage(deleted, request);
+
+      return reply.send({
+        ok: true,
+        message: "File deleted successfully",
+        file: deleted.route ? toAdminTrackedFile(deleted.route) : null,
+      });
+    },
+  );
+
+  fastify.get(
+    "/admin/api/runtime-export",
+    {
+      config: { skipAuth: true },
+    },
+    async (_request, reply) => {
+      const snapshot = {
+        version: 1,
+        exportedAt: Date.now(),
+        instanceId: config.INSTANCE_ID,
+        accounts: getAllAccounts().map(toPrivateExportAccount),
+        buckets: getAllBuckets(),
+        routes: getAllRoutes().map(toRuntimeExportRoute),
+      };
+
+      reply
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("Content-Disposition", `attachment; filename="s3proxy-runtime-export-${Date.now()}.json"`)
+        .send(snapshot);
+    },
+  );
+
+  fastify.post(
+    "/admin/api/runtime-import",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const payload = parseBodyObject(request.body);
+      const accountsInput = Array.isArray(payload.accounts) ? payload.accounts : Object.values(payload.accounts ?? {});
+      const bucketsInput = Array.isArray(payload.buckets) ? payload.buckets : Object.values(payload.buckets ?? {});
+      const routesInput = Array.isArray(payload.routes) ? payload.routes : Object.values(payload.routes ?? {});
+
+      if (accountsInput.length === 0 && bucketsInput.length === 0 && routesInput.length === 0) {
+        return reply.code(400).send({
+          ok: false,
+          error: "Payload must contain at least one of: accounts, buckets, routes",
+        });
+      }
+
+      const importedAccounts = [];
+      for (const account of accountsInput) {
+        if (!account || typeof account !== "object") continue;
+        const normalized = toPrivateExportAccount({
+          ...account,
+          account_id: account.account_id ?? account.accountId,
+          access_key_id: account.access_key_id ?? account.accessKeyId,
+          secret_key: account.secret_key ?? account.secretAccessKey,
+          addressing_style: account.addressing_style ?? account.addressingStyle,
+          payload_signing_mode: account.payload_signing_mode ?? account.payloadSigningMode,
+          email_owner: account.email_owner ?? account.emailOwner,
+          supabase_access_token: account.supabase_access_token ?? account.supabaseAccessToken,
+          supabase_access_token_exp: account.supabase_access_token_exp ?? account.supabaseAccessTokenExp ?? account.supabaseAccessTokenExperimental,
+          public_bucket: account.public_bucket ?? account.publicBucket,
+          quota_bytes: account.quota_bytes ?? account.quotaBytes,
+          used_bytes: account.used_bytes ?? account.usedBytes,
+          added_at: account.added_at ?? account.addedAt,
+        });
+        if (!normalized.account_id) continue;
+        upsertAccount(normalized);
+        importedAccounts.push(normalized);
+      }
+
+      const importedBuckets = [];
+      for (const bucket of bucketsInput) {
+        if (!bucket || typeof bucket !== "object" || !bucket.bucket) continue;
+        importedBuckets.push(
+          upsertBucketRecord({
+            bucket: bucket.bucket,
+            created_at: bucket.created_at ?? bucket.createdAt,
+            updated_at: bucket.updated_at ?? bucket.updatedAt,
+            deleted_at: bucket.deleted_at ?? bucket.deletedAt ?? null,
+            versioning_status: bucket.versioning_status ?? bucket.versioningStatus ?? "",
+          }),
+        );
+      }
+
+      const importedRoutes = [];
+      for (const route of routesInput) {
+        if (!route || typeof route !== "object") continue;
+        const normalized = {
+          ...route,
+          encoded_key: route.encoded_key ?? route.encodedKey ?? (route.bucket && route.object_key ? encodeKey(route.bucket, route.object_key) : null),
+          account_id: route.account_id ?? route.accountId,
+          object_key: route.object_key ?? route.objectKey,
+          backend_key: route.backend_key ?? route.backendKey,
+          size_bytes: route.size_bytes ?? route.sizeBytes ?? 0,
+          last_modified: route.last_modified ?? route.lastModified ?? route.uploaded_at ?? route.uploadedAt ?? Date.now(),
+          content_type: route.content_type ?? route.contentType ?? null,
+          uploaded_at: route.uploaded_at ?? route.uploadedAt ?? Date.now(),
+          updated_at: route.updated_at ?? route.updatedAt ?? Date.now(),
+          deleted_at: route.deleted_at ?? route.deletedAt ?? null,
+          metadata_version: route.metadata_version ?? route.metadataVersion ?? 1,
+          route_scope: route.route_scope ?? route.routeScope ?? ROUTE_SCOPE.MAIN,
+          public_url: route.public_url ?? route.publicUrl ?? null,
+          state: route.state ?? ROUTE_STATE.ACTIVE,
+          sync_state: route.sync_state ?? route.syncState ?? "PENDING_SYNC",
+          reconcile_status: route.reconcile_status ?? route.reconcileStatus ?? ROUTE_RECONCILE_STATUS.HEALTHY,
+          backend_last_seen_at: route.backend_last_seen_at ?? route.backendLastSeenAt ?? null,
+          backend_missing_since: route.backend_missing_since ?? route.backendMissingSince ?? null,
+          last_reconciled_at: route.last_reconciled_at ?? route.lastReconciledAt ?? null,
+          instance_id: route.instance_id ?? route.instanceId ?? config.INSTANCE_ID,
+        };
+
+        if (!normalized.encoded_key || !normalized.account_id || !normalized.bucket || !normalized.object_key) {
+          continue;
+        }
+
+        upsertRoute(normalized);
+        importedRoutes.push(normalized);
+      }
+
+      reloadAccountsFromSQLite();
+
+      let rtdbSynced = true;
+      let warning = "";
+      try {
+        const updates = {
+          ...Object.fromEntries(importedAccounts.map((account) => [buildRtdbAccountPath(account.account_id), toRtdbAccountDocument(account)])),
+          ...Object.fromEntries(importedRoutes.map((route) => [`/routes/${route.encoded_key}`, buildRtdbRouteDocument(route)])),
+        };
+
+        if (Object.keys(updates).length > 0) {
+          await rtdbBatchPatch(updates);
+          await reloadAccountsFromRTDB();
+        }
+      } catch (err) {
+        rtdbSynced = false;
+        warning = `Runtime metadata imported locally, but RTDB sync failed: ${err?.message ?? String(err)}`;
+        request.log.warn({ err }, "runtime import RTDB sync failed");
+        reloadAccountsFromSQLite();
+      }
+
+      return reply.send({
+        ok: true,
+        imported: {
+          accounts: importedAccounts.length,
+          buckets: importedBuckets.length,
+          routes: importedRoutes.length,
+          publicFiles: importedRoutes.filter((route) => route.route_scope === ROUTE_SCOPE.PUBLIC).length,
+        },
+        rtdbSynced,
+        warning: warning || undefined,
+      });
+    },
+  );
+
+  fastify.post(
+    "/admin/api/cron-jobs",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      try {
+        const saved = saveCronJob(parseBodyObject(request.body));
+        return reply.send({ ok: true, job: saved });
+      } catch (err) {
+        return reply.code(400).send({ ok: false, error: err?.message ?? String(err) });
+      }
+    },
+  );
+
+  fastify.post(
+    "/admin/api/cron-jobs/:jobId/run",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      try {
+        const payload = parseBodyObject(request.body);
+        const result = await runCronJobNow(request.params.jobId, {
+          overridePayload: payload.payload && typeof payload.payload === "object" && !Array.isArray(payload.payload) ? payload.payload : undefined,
+        });
+        return reply.send({
+          ok: result.lastRunStatus === "ok",
+          jobId: result.job_id,
+          jobName: result.name,
+          kind: result.kind,
+          source: result.source,
+          manualOnly: result.manualOnly === true,
+          apiPath: result.apiPath,
+          lastRunStatus: result.lastRunStatus,
+          lastRunError: result.lastRunError,
+          report: result.lastRunReport ?? null,
+        });
+      } catch (err) {
+        return reply.code(404).send({ ok: false, error: err?.message ?? String(err) });
+      }
+    },
+  );
+
+  fastify.post("/api/cron-jobs/:jobId/run", async (request, reply) => {
+    try {
+      const payload = parseBodyObject(request.body);
+      const result = await runCronJobNow(request.params.jobId, {
+        overridePayload: payload.payload && typeof payload.payload === "object" && !Array.isArray(payload.payload) ? payload.payload : undefined,
+      });
+      return reply.send({
+        ok: result.lastRunStatus === "ok",
+        jobId: result.job_id,
+        jobName: result.name,
+        kind: result.kind,
+        source: result.source,
+        manualOnly: result.manualOnly === true,
+        apiPath: result.apiPath,
+        lastRunStatus: result.lastRunStatus,
+        lastRunError: result.lastRunError,
+        report: result.lastRunReport ?? null,
+      });
+    } catch (err) {
+      const message = err?.message ?? String(err);
+      const statusCode = /not found/i.test(message) ? 404 : 400;
+      return reply.code(statusCode).send({ ok: false, error: message });
+    }
+  });
+
+  fastify.delete(
+    "/admin/api/cron-jobs/:jobId",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      try {
+        const removed = removeCronJob(request.params.jobId);
+        if (!removed) {
+          return reply.code(404).send({ ok: false, error: "job not found" });
+        }
+        return reply.send({ ok: true });
+      } catch (err) {
+        return reply.code(400).send({ ok: false, error: err?.message ?? String(err) });
+      }
+    },
+  );
+
+  fastify.post(
+    "/admin/api/test-s3",
+    {
+      config: { skipAuth: true },
+    },
+    async (request, reply) => {
+      const payload = parseBodyObject(request.body);
+      const all = getAllAccounts().filter((item) => item.active === 1 || item.active === true);
+
+      let targets = [];
+      if (payload.allActive === true) {
+        targets = all;
+      } else if (payload.accountId) {
+        targets = all.filter((item) => item.account_id === String(payload.accountId));
+      }
+
+      if (targets.length === 0) {
+        return reply.code(400).send({ ok: false, error: "account not found or inactive" });
+      }
+
+      const results = [];
+      for (const account of targets) {
+        try {
+          const result = await runS3Probe(account);
+          results.push(result);
+        } catch (err) {
+          results.push({
+            accountId: account.account_id,
+            bucket: account.bucket,
+            ok: false,
+            error: err?.message ?? String(err),
+          });
+        }
+      }
+
+      return reply.send({
+        ok: results.every((item) => item.ok),
+        count: results.length,
+        results,
+      });
+    },
+  );
 }
